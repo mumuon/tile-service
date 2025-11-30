@@ -1,0 +1,7 @@
+.env
+.env.local
+.env.*.local
+tile-service
+*.log
+public/tiles/
+/tmp/
