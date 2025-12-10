@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -73,14 +74,21 @@ func NewS3Client(cfg S3Config) (*S3Client, error) {
 	}, nil
 }
 
-// UploadDirectory uploads all files from a directory to S3
+// UploadDirectory uploads all files from a directory to S3 using parallel workers
 func (s *S3Client) UploadDirectory(ctx context.Context, localDir, s3Prefix string) (int64, error) {
 	logger := slog.With("local_dir", localDir, "s3_prefix", s3Prefix)
-	logger.Info("starting directory upload to R2")
+	logger.Info("starting parallel directory upload to R2")
 
-	var totalBytes int64
+	// First, collect all files to upload
+	type fileToUpload struct {
+		path     string
+		relPath  string
+		s3Key    string
+		size     int64
+	}
 
-	// Walk through all files in the directory
+	var files []fileToUpload
+
 	err := filepath.Walk(localDir, func(filePath string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -90,49 +98,114 @@ func (s *S3Client) UploadDirectory(ctx context.Context, localDir, s3Prefix strin
 			return nil
 		}
 
-		// Calculate relative path
 		relPath, err := filepath.Rel(localDir, filePath)
 		if err != nil {
 			return err
 		}
 
-		// Build S3 key
 		s3Key := filepath.Join(s3Prefix, filepath.ToSlash(relPath))
-		logger := logger.With("file", relPath, "s3_key", s3Key)
 
-		// Open file
-		file, err := os.Open(filePath)
-		if err != nil {
-			logger.Error("failed to open file", "error", err)
-			return err
-		}
-		defer file.Close()
-
-		// Upload file
-		result, err := s.uploader.Upload(ctx, &s3.PutObjectInput{
-			Bucket: aws.String(s.bucket),
-			Key:    aws.String(s3Key),
-			Body:   file,
-			ACL:    types.ObjectCannedACLPublicRead, // Make public for CDN
+		files = append(files, fileToUpload{
+			path:    filePath,
+			relPath: relPath,
+			s3Key:   s3Key,
+			size:    info.Size(),
 		})
-
-		if err != nil {
-			logger.Error("failed to upload file", "error", err)
-			return err
-		}
-
-		totalBytes += info.Size()
-		logger.Debug("file uploaded", "size_bytes", info.Size(), "s3_location", result.Location)
 
 		return nil
 	})
 
 	if err != nil {
-		logger.Error("directory upload failed", "error", err)
-		return 0, fmt.Errorf("failed to upload directory: %w", err)
+		logger.Error("failed to scan directory", "error", err)
+		return 0, fmt.Errorf("failed to scan directory: %w", err)
 	}
 
-	logger.Info("directory upload completed", "total_bytes", totalBytes)
+	logger.Info("found files to upload", "count", len(files))
+
+	// Upload files in parallel using worker pool
+	const numWorkers = 32 // Parallel upload workers
+	var totalBytes int64
+	var fileCount int
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Create channel for work distribution
+	workChan := make(chan fileToUpload, numWorkers*2)
+	errChan := make(chan error, 1)
+
+	// Start workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			for file := range workChan {
+				// Open file
+				f, err := os.Open(file.path)
+				if err != nil {
+					select {
+					case errChan <- fmt.Errorf("failed to open file %s: %w", file.relPath, err):
+					default:
+					}
+					return
+				}
+
+				// Upload file
+				_, err = s.uploader.Upload(ctx, &s3.PutObjectInput{
+					Bucket: aws.String(s.bucket),
+					Key:    aws.String(file.s3Key),
+					Body:   f,
+					ACL:    types.ObjectCannedACLPublicRead,
+				})
+				f.Close()
+
+				if err != nil {
+					select {
+					case errChan <- fmt.Errorf("failed to upload file %s: %w", file.relPath, err):
+					default:
+					}
+					return
+				}
+
+				// Update stats
+				mu.Lock()
+				totalBytes += file.size
+				fileCount++
+				currentCount := fileCount
+				currentBytes := totalBytes
+				mu.Unlock()
+
+				// Log progress every 1000 files
+				if currentCount%1000 == 0 {
+					logger.Info("upload progress", "files_uploaded", currentCount, "bytes_uploaded", currentBytes)
+				}
+			}
+		}(i)
+	}
+
+	// Send work to workers
+	go func() {
+		for _, file := range files {
+			select {
+			case <-ctx.Done():
+				return
+			case workChan <- file:
+			}
+		}
+		close(workChan)
+	}()
+
+	// Wait for completion
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors
+	if err := <-errChan; err != nil {
+		logger.Error("upload failed", "error", err)
+		return 0, err
+	}
+
+	logger.Info("directory upload completed", "total_files", fileCount, "total_bytes", totalBytes)
 	return totalBytes, nil
 }
 

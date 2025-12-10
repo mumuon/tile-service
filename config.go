@@ -39,6 +39,7 @@ type S3Config struct {
 type PathsConfig struct {
 	CurvatureData string // Where KMZ files are located
 	TempDir       string // Temporary working directory
+	OutputDir     string // Where generated tiles are stored
 }
 
 // ServiceConfig represents service-level settings
@@ -76,6 +77,7 @@ func LoadConfig(envPath string) (*Config, error) {
 		Paths: PathsConfig{
 			CurvatureData: getEnv("CURVATURE_DATA_DIR", "./curvature-data"),
 			TempDir:       getEnv("TEMP_DIR", "/tmp"),
+			OutputDir:     getEnv("OUTPUT_DIR", "./public/tiles"),
 		},
 		Service: ServiceConfig{
 			Workers:     getEnvInt("WORKERS", 3),

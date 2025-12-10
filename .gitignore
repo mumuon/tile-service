@@ -5,3 +5,7 @@ tile-service
 *.log
 public/tiles/
 /tmp/
+
+# Extraction progress files
+.extract-progress-*.json
+.extracted-roads-*.json

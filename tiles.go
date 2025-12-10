@@ -10,12 +10,12 @@ import (
 )
 
 // GenerateTiles generates vector tiles from GeoJSON using Tippecanoe
-func GenerateTiles(ctx context.Context, geoJSONPath, region string) (string, int, int64, error) {
+func GenerateTiles(ctx context.Context, geoJSONPath, region string, outputBaseDir string) (string, int, int64, error) {
 	logger := slog.With("region", region, "geojson", geoJSONPath)
 	logger.Info("generating tiles with Tippecanoe")
 
 	// Create output directory
-	tilesDir := filepath.Join("./public/tiles", region)
+	tilesDir := filepath.Join(outputBaseDir, region)
 	if err := os.RemoveAll(tilesDir); err != nil && !os.IsNotExist(err) {
 		logger.Warn("failed to remove existing tiles directory", "error", err)
 	}

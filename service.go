@@ -105,90 +105,229 @@ func (s *TileService) UploadToR2WithZoomFilter(ctx context.Context, tilesDir, re
 
 // ProcessJobWithOptions orchestrates the entire tile generation pipeline with custom options
 func (s *TileService) ProcessJobWithOptions(ctx context.Context, job *TileJob, opts *JobOptions) error {
-	logger := slog.With("region", job.Region, "min_zoom", opts.MinZoom, "max_zoom", opts.MaxZoom)
+	logger := slog.With("region", job.Region, "min_zoom", opts.MinZoom, "max_zoom", opts.MaxZoom, "skip_generation", opts.SkipGeneration)
 
-	// Update database status if available
-	if s.db != nil {
-		if err := s.db.UpdateJobStatus(ctx, job.ID, "extracting"); err != nil {
-			logger.Warn("failed to update job status", "error", err)
+	var tilesDir string
+	var tilesCount int
+	var totalSize int64
+	var roadsCount int
+	var kmlPath, geoJSONPath string
+
+	// If skipGeneration is true, skip tile generation and use existing tiles
+	if opts.SkipGeneration {
+		logger.Info("skipping tile generation, using existing tiles")
+
+		// Use existing tiles directory
+		tilesDir = filepath.Join(s.config.Paths.OutputDir, job.Region)
+
+		// Check if tiles directory exists
+		if _, err := os.Stat(tilesDir); os.IsNotExist(err) {
+			if s.db != nil {
+				s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("tiles directory does not exist: %s", tilesDir))
+			}
+			return fmt.Errorf("tiles directory does not exist: %s", tilesDir)
 		}
-	}
 
-	// Phase 1: Extract KMZ
-	logger.Info("extracting KMZ")
-	kmlPath, err := ExtractKMZFromDir(ctx, job.Region, s.config.Paths.CurvatureData)
-	if err != nil {
-		if s.db != nil {
-			s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("extraction failed: %v", err))
+		// Count existing tiles
+		var err error
+		tilesCount, err = countTiles(tilesDir)
+		if err != nil {
+			logger.Warn("failed to count tiles", "error", err)
 		}
-		return fmt.Errorf("failed to extract KMZ: %w", err)
-	}
-	logger.Debug("KMZ extracted", "kml_path", kmlPath)
 
-	// Phase 2: Convert KML to GeoJSON
-	logger.Info("converting KML to GeoJSON")
-	geoJSONPath, roadsCount, err := ConvertKMLToGeoJSON(ctx, kmlPath, job.Region)
-	if err != nil {
-		if s.db != nil {
-			s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("conversion failed: %v", err))
+		totalSize, err = getDirectorySize(tilesDir)
+		if err != nil {
+			logger.Warn("failed to calculate directory size", "error", err)
 		}
-		return fmt.Errorf("failed to convert KML: %w", err)
-	}
-	logger.Info("KML converted", "geojson_path", geoJSONPath, "roads_count", roadsCount)
 
-	if s.db != nil {
-		if err := s.db.UpdateJobProgress(ctx, job.ID, roadsCount, 0); err != nil {
-			logger.Warn("failed to update progress", "error", err)
-		}
-	}
+		logger.Info("using existing tiles", "tiles_dir", tilesDir, "tiles_count", tilesCount, "size_bytes", totalSize)
 
-	// Phase 3: Generate tiles with Tippecanoe
-	logger.Info("generating tiles with Tippecanoe")
-	if s.db != nil {
-		if err := s.db.UpdateJobStatus(ctx, job.ID, "generating"); err != nil {
-			logger.Warn("failed to update job status", "error", err)
-		}
-	}
-
-	// Note: Currently GenerateTiles uses hardcoded 5-16 zoom levels
-	// TODO: Make Tippecanoe zoom levels configurable via opts.MinZoom/opts.MaxZoom
-	tilesDir, tilesCount, totalSize, err := GenerateTiles(ctx, geoJSONPath, job.Region)
-	if err != nil {
-		if s.db != nil {
-			s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("tile generation failed: %v", err))
-		}
-		return fmt.Errorf("failed to generate tiles: %w", err)
-	}
-	logger.Info("tiles generated", "tiles_dir", tilesDir, "tiles_count", tilesCount, "size_bytes", totalSize)
-
-	if s.db != nil {
-		if err := s.db.UpdateJobProgress(ctx, job.ID, roadsCount, tilesCount); err != nil {
-			logger.Warn("failed to update progress", "error", err)
-		}
-	}
-
-	// Phase 4: Upload to R2 (unless skipped)
-	if !opts.SkipUpload {
-		logger.Info("uploading tiles to R2")
 		if s.db != nil {
 			if err := s.db.UpdateJobStatus(ctx, job.ID, "uploading"); err != nil {
 				logger.Warn("failed to update job status", "error", err)
 			}
 		}
+	} else {
+		// Normal flow: generate tiles
 
-		uploadedBytes, err := s.UploadToR2(ctx, tilesDir, job.Region)
+		// Update database status if available
+		if s.db != nil {
+			if err := s.db.UpdateJobStatus(ctx, job.ID, "extracting"); err != nil {
+				logger.Warn("failed to update job status", "error", err)
+			}
+		}
+
+		// Phase 1: Extract KMZ
+		logger.Info("extracting KMZ")
+		var err error
+		kmlPath, err = ExtractKMZFromDir(ctx, job.Region, s.config.Paths.CurvatureData)
 		if err != nil {
 			if s.db != nil {
-				s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("R2 upload failed: %v", err))
+				s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("extraction failed: %v", err))
 			}
-			return fmt.Errorf("failed to upload to R2: %w", err)
+			return fmt.Errorf("failed to extract KMZ: %w", err)
 		}
-		logger.Info("upload completed", "uploaded_bytes", uploadedBytes)
-	} else {
-		logger.Info("skipping R2 upload, tiles saved locally", "tiles_dir", tilesDir)
+		logger.Debug("KMZ extracted", "kml_path", kmlPath)
+
+		// Phase 2: Convert KML to GeoJSON
+		logger.Info("converting KML to GeoJSON")
+		geoJSONPath, roadsCount, err = ConvertKMLToGeoJSON(ctx, kmlPath, job.Region)
+		if err != nil {
+			if s.db != nil {
+				s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("conversion failed: %v", err))
+			}
+			return fmt.Errorf("failed to convert KML: %w", err)
+		}
+		logger.Info("KML converted", "geojson_path", geoJSONPath, "roads_count", roadsCount)
+
+		if s.db != nil {
+			if err := s.db.UpdateJobProgress(ctx, job.ID, roadsCount, 0); err != nil {
+				logger.Warn("failed to update progress", "error", err)
+			}
+		}
+
+		// Phase 3: Generate tiles with Tippecanoe
+		logger.Info("generating tiles with Tippecanoe")
+		if s.db != nil {
+			if err := s.db.UpdateJobStatus(ctx, job.ID, "generating"); err != nil {
+				logger.Warn("failed to update job status", "error", err)
+			}
+		}
+
+		// Note: Currently GenerateTiles uses hardcoded 5-16 zoom levels
+		// TODO: Make Tippecanoe zoom levels configurable via opts.MinZoom/opts.MaxZoom
+		tilesDir, tilesCount, totalSize, err = GenerateTiles(ctx, geoJSONPath, job.Region, s.config.Paths.OutputDir)
+		if err != nil {
+			if s.db != nil {
+				s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("tile generation failed: %v", err))
+			}
+			return fmt.Errorf("failed to generate tiles: %w", err)
+		}
+		logger.Info("tiles generated", "tiles_dir", tilesDir, "tiles_count", tilesCount, "size_bytes", totalSize)
+
+		if s.db != nil {
+			if err := s.db.UpdateJobProgress(ctx, job.ID, roadsCount, tilesCount); err != nil {
+				logger.Warn("failed to update progress", "error", err)
+			}
+		}
 	}
 
-	// Phase 5: Mark as complete
+	// Phase 4 & 5: Run geometry extraction and R2 upload in parallel
+	// This significantly speeds up processing by utilizing concurrent I/O operations
+	logger.Info("starting parallel operations: geometry extraction and R2 upload")
+
+	// Update job status to show we're in the upload/extraction phase
+	if s.db != nil {
+		statusMsg := "uploading"
+		if opts.ExtractGeometry && !opts.SkipUpload {
+			statusMsg = "uploading/extracting"
+		} else if opts.ExtractGeometry {
+			statusMsg = "extracting"
+		}
+		if err := s.db.UpdateJobStatus(ctx, job.ID, statusMsg); err != nil {
+			logger.Warn("failed to update job status", "error", err)
+		}
+	}
+
+	// Use channels to collect results and errors
+	type uploadResult struct {
+		bytes int64
+		err   error
+	}
+	type geometryResult struct {
+		count int
+		err   error
+	}
+
+	uploadChan := make(chan uploadResult, 1)
+	geometryChan := make(chan geometryResult, 1)
+
+	// Goroutine 1: Extract and insert road geometries
+	if opts.ExtractGeometry {
+		go func() {
+			logger.Info("starting road geometry extraction (parallel)")
+			extractor := NewGeometryExtractor()
+
+			roads, err := extractor.ExtractRoadGeometriesFromTiles(ctx, tilesDir, job.Region)
+			if err != nil {
+				logger.Warn("failed to extract road geometries", "error", err)
+				geometryChan <- geometryResult{0, err}
+				return
+			}
+
+			logger.Info("road geometries extracted", "count", len(roads))
+
+			if opts.SkipGeometryInsertion {
+				logger.Info("skipping database insertion, geometries saved to file",
+					"file", extractor.getExtractionFile(job.Region))
+				geometryChan <- geometryResult{len(roads), nil}
+			} else if s.db != nil {
+				// Insert into database with large batch size
+				inserted, err := s.db.BatchUpsertRoadGeometries(ctx, roads, 9000)
+				if err != nil {
+					logger.Warn("failed to insert road geometries", "error", err)
+					geometryChan <- geometryResult{0, err}
+					return
+				}
+
+				logger.Info("road geometries inserted into database", "count", inserted)
+
+				// Cleanup extraction files after successful insertion
+				if err := extractor.CleanupExtractionFiles(job.Region); err != nil {
+					logger.Warn("failed to cleanup extraction files", "error", err)
+				}
+
+				geometryChan <- geometryResult{inserted, nil}
+			} else {
+				logger.Warn("database not available, geometries saved to file only")
+				geometryChan <- geometryResult{len(roads), nil}
+			}
+		}()
+	} else {
+		// If not extracting geometry, send a success result immediately
+		geometryChan <- geometryResult{0, nil}
+	}
+
+	// Goroutine 2: Upload to R2
+	if !opts.SkipUpload {
+		go func() {
+			logger.Info("starting R2 upload (parallel)")
+			uploadedBytes, err := s.UploadToR2(ctx, tilesDir, job.Region)
+			if err != nil {
+				logger.Error("R2 upload failed", "error", err)
+				uploadChan <- uploadResult{0, err}
+				return
+			}
+			logger.Info("R2 upload completed", "uploaded_bytes", uploadedBytes)
+			uploadChan <- uploadResult{uploadedBytes, nil}
+		}()
+	} else {
+		logger.Info("skipping R2 upload, tiles saved locally", "tiles_dir", tilesDir)
+		uploadChan <- uploadResult{0, nil}
+	}
+
+	// Wait for both operations to complete
+	uploadRes := <-uploadChan
+	geometryRes := <-geometryChan
+
+	// Check for errors
+	if uploadRes.err != nil {
+		if s.db != nil {
+			s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("R2 upload failed: %v", uploadRes.err))
+		}
+		return fmt.Errorf("failed to upload to R2: %w", uploadRes.err)
+	}
+
+	// Geometry extraction errors are non-fatal (we already logged them)
+	if geometryRes.err != nil {
+		logger.Warn("geometry extraction completed with errors", "error", geometryRes.err)
+	}
+
+	logger.Info("parallel operations completed",
+		"uploaded_bytes", uploadRes.bytes,
+		"geometry_count", geometryRes.count)
+
+	// Phase 6: Mark as complete
 	if s.db != nil {
 		if err := s.db.CompleteJob(ctx, job.ID, roadsCount, tilesCount, totalSize); err != nil {
 			logger.Warn("failed to mark job complete", "error", err)
@@ -206,4 +345,38 @@ func (s *TileService) ProcessJobWithOptions(ctx context.Context, job *TileJob, o
 
 	logger.Info("job processing complete")
 	return nil
+}
+
+// ExtractRoadGeometriesFromExistingTiles extracts road geometries from already-generated tiles
+func (s *TileService) ExtractRoadGeometriesFromExistingTiles(ctx context.Context, tilesDir, region string) (int, error) {
+	logger := slog.With("region", region, "tiles_dir", tilesDir)
+	logger.Info("extracting road geometries from existing tiles")
+
+	extractor := NewGeometryExtractor()
+
+	// Extract roads from tiles
+	roads, err := extractor.ExtractRoadGeometriesFromTiles(ctx, tilesDir, region)
+	if err != nil {
+		return 0, fmt.Errorf("failed to extract road geometries: %w", err)
+	}
+
+	logger.Info("road geometries extracted", "count", len(roads))
+
+	// Insert into database if available
+	if s.db != nil {
+		inserted, err := s.db.BatchUpsertRoadGeometries(ctx, roads, 9000)
+		if err != nil {
+			return 0, fmt.Errorf("failed to insert road geometries: %w", err)
+		}
+		logger.Info("road geometries inserted into database", "count", inserted)
+
+		// Cleanup extraction files
+		if err := extractor.CleanupExtractionFiles(region); err != nil {
+			logger.Warn("failed to cleanup extraction files", "error", err)
+		}
+
+		return inserted, nil
+	}
+
+	return len(roads), nil
 }

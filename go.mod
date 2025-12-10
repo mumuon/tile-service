@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.92.1
 	github.com/aws/smithy-go v1.23.2
 	github.com/lib/pq v1.10.9
+	github.com/paulmach/orb v0.11.1
 )
 
 require (
@@ -27,4 +28,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.10 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.2 // indirect
+	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/paulmach/protoscan v0.2.1 // indirect
+	go.mongodb.org/mongo-driver v1.11.4 // indirect
 )

@@ -4,21 +4,28 @@ import "time"
 
 // TileJob represents a tile generation job
 type TileJob struct {
-	ID               string
-	Region           string
-	Status           string // "pending", "extracting", "generating", "uploading", "completed", "failed", "cancelled"
-	CurrentStep      *string
-	RoadsExtracted   int
-	TilesGenerated   int
-	TotalSizeBytes   int64
-	UploadProgress   int
-	UploadedBytes    int64
-	ErrorMessage     *string
-	ErrorLog         *string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	StartedAt        *time.Time
-	CompletedAt      *time.Time
+	ID                    string
+	Region                string
+	Status                string // "pending", "extracting", "generating", "uploading", "completed", "failed", "cancelled"
+	MaxZoom               int
+	MinZoom               int
+	SkipUpload            bool
+	SkipGeneration        bool
+	NoCleanup             bool
+	ExtractGeometry       bool
+	SkipGeometryInsertion bool
+	CurrentStep           *string
+	RoadsExtracted        *int
+	TilesGenerated        *int
+	TotalSizeBytes        *int64
+	UploadProgress        int
+	UploadedBytes         int64
+	ErrorMessage          *string
+	ErrorLog              *string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+	StartedAt             *time.Time
+	CompletedAt           *time.Time
 }
 
 // JobProgress represents progress update for a job
@@ -73,8 +80,11 @@ type ProcessingResult struct {
 
 // JobOptions represents optional configuration for tile generation
 type JobOptions struct {
-	MaxZoom    int
-	MinZoom    int
-	SkipUpload bool
-	NoCleanup  bool
+	MaxZoom               int
+	MinZoom               int
+	SkipUpload            bool
+	SkipGeneration        bool // Skip tile generation, only upload existing tiles
+	NoCleanup             bool
+	ExtractGeometry       bool // Extract road geometries into database for nearby roads feature
+	SkipGeometryInsertion bool // Extract to file but don't insert into database
 }
