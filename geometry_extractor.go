@@ -82,6 +82,9 @@ func (e *GeometryExtractor) ExtractRoadGeometriesFromTiles(ctx context.Context, 
 	// Map to deduplicate roads across tiles
 	roadsMap := make(map[string]*RoadGeometry)
 
+	// Track invalid roads with zero coordinates
+	invalidRoadCount := 0
+
 	// Load existing roads from extraction file if resuming
 	extractionFile := e.getExtractionFile(region)
 	if progress.ProcessedTiles > 0 {
@@ -128,10 +131,18 @@ func (e *GeometryExtractor) ExtractRoadGeometriesFromTiles(ctx context.Context, 
 		}
 
 		// Process tile
-		roads, err := e.extractRoadsFromTile(pbfFile, region, tileCoords)
+		roads, invalidCountFromTile, err := e.extractRoadsFromTile(pbfFile, region, tileCoords)
 		if err != nil {
 			logger.Warn("failed to extract from tile", "file", pbfFile, "error", err)
 			continue
+		}
+
+		// Track invalid roads
+		invalidRoadCount += invalidCountFromTile
+
+		// Fail fast if we're seeing too many invalid roads
+		if invalidRoadCount > 100 {
+			return nil, fmt.Errorf("ABORTING: found %d roads with zero coordinates - this indicates a bug in calculateBounds()", invalidRoadCount)
 		}
 
 		// Merge roads into map
@@ -178,20 +189,22 @@ func (e *GeometryExtractor) ExtractRoadGeometriesFromTiles(ctx context.Context, 
 }
 
 // extractRoadsFromTile extracts roads from a single tile file
-func (e *GeometryExtractor) extractRoadsFromTile(pbfFile, region string, tileCoords maptile.Tile) ([]RoadGeometry, error) {
+// Returns: roads slice, count of invalid roads (with zero coordinates), error
+func (e *GeometryExtractor) extractRoadsFromTile(pbfFile, region string, tileCoords maptile.Tile) ([]RoadGeometry, int, error) {
 	// Read tile file
 	data, err := os.ReadFile(pbfFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read tile: %w", err)
+		return nil, 0, fmt.Errorf("failed to read tile: %w", err)
 	}
 
 	// Decode MVT
 	layers, err := mvt.Unmarshal(data)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal MVT: %w", err)
+		return nil, 0, fmt.Errorf("failed to unmarshal MVT: %w", err)
 	}
 
 	var roads []RoadGeometry
+	invalidCount := 0
 
 	// Look for "roads" layer
 	for _, layer := range layers {
@@ -201,19 +214,28 @@ func (e *GeometryExtractor) extractRoadsFromTile(pbfFile, region string, tileCoo
 
 		// Process each feature
 		for featureIdx, feature := range layer.Features {
-			// Get road name/ID
+			// DEBUG: Log first 3 features' properties to see what's available
+			if featureIdx < 3 {
+				e.logger.Info("DEBUG: Feature properties in tile",
+					"tile", fmt.Sprintf("%d/%d/%d", tileCoords.Z, tileCoords.X, tileCoords.Y),
+					"featureIdx", featureIdx,
+					"properties", feature.Properties,
+					"propertyKeys", getPropertyKeys(feature.Properties))
+			}
+
+			// Get road name/ID - include region prefix to avoid collisions across regions
 			roadID := ""
 			if name, ok := feature.Properties["Name"].(string); ok && name != "" {
-				roadID = name
+				roadID = fmt.Sprintf("%s_%s", region, name)
 			}
 			if roadID == "" {
 				if id, ok := feature.Properties["id"].(string); ok && id != "" {
-					roadID = id
+					roadID = fmt.Sprintf("%s_%s", region, id)
 				}
 			}
 			if roadID == "" {
 				// Generate unique ID from tile coordinates and feature index
-				roadID = fmt.Sprintf("road_%d_%d_%d_%d", tileCoords.Z, tileCoords.X, tileCoords.Y, featureIdx)
+				roadID = fmt.Sprintf("%s_road_%d_%d_%d_%d", region, tileCoords.Z, tileCoords.X, tileCoords.Y, featureIdx)
 			}
 
 			// Get curvature if available
@@ -231,19 +253,40 @@ func (e *GeometryExtractor) extractRoadsFromTile(pbfFile, region string, tileCoo
 				continue
 			}
 
+			// Extract coordinates
+			minLat := bounds.Min.Lat()
+			maxLat := bounds.Max.Lat()
+			minLng := bounds.Min.Lon()
+			maxLng := bounds.Max.Lon()
+
+			// Validate: skip and log if any coordinate is zero
+			if minLat == 0 || maxLat == 0 || minLng == 0 || maxLng == 0 {
+				invalidCount++
+				e.logger.Error("INVALID ROAD: zero coordinates detected",
+					"roadId", roadID,
+					"tile", fmt.Sprintf("%d/%d/%d", tileCoords.Z, tileCoords.X, tileCoords.Y),
+					"minLat", minLat, "maxLat", maxLat,
+					"minLng", minLng, "maxLng", maxLng,
+					"bounds.Min.Lat()", bounds.Min.Lat(),
+					"bounds.Max.Lat()", bounds.Max.Lat(),
+					"bounds.Min.Lon()", bounds.Min.Lon(),
+					"bounds.Max.Lon()", bounds.Max.Lon())
+				continue
+			}
+
 			roads = append(roads, RoadGeometry{
 				RoadID:    roadID,
 				Region:    region,
-				MinLat:    bounds.Min.Lat(),
-				MaxLat:    bounds.Max.Lat(),
-				MinLng:    bounds.Min.Lon(),
-				MaxLng:    bounds.Max.Lon(),
+				MinLat:    minLat,
+				MaxLat:    maxLat,
+				MinLng:    minLng,
+				MaxLng:    maxLng,
 				Curvature: curvature,
 			})
 		}
 	}
 
-	return roads, nil
+	return roads, invalidCount, nil
 }
 
 // calculateBounds calculates the geographic bounding box for a geometry
@@ -252,49 +295,56 @@ func (e *GeometryExtractor) calculateBounds(geom orb.Geometry, tile maptile.Tile
 		return nil
 	}
 
-	// Get tile bounds in geographic coordinates
-	tileBound := tile.Bound()
-
 	// Helper function to convert tile-space coords (0-4096) to lat/lng
+	// Uses Web Mercator projection (same as Mapbox tiles)
 	tileCoordToLatLng := func(x, y float64) orb.Point {
-		// Interpolate between tile bounds
-		lng := tileBound.Min.Lon() + (x/4096.0)*(tileBound.Max.Lon()-tileBound.Min.Lon())
-		lat := tileBound.Max.Lat() + (y/4096.0)*(tileBound.Min.Lat()-tileBound.Max.Lat())
+		// Get tile bounds in Web Mercator space
+		n := math.Pow(2.0, float64(tile.Z))
+
+		// Calculate tile-space fraction (0-1)
+		xFrac := x / 4096.0
+		yFrac := y / 4096.0
+
+		// Tile indices with fractional part
+		tileX := float64(tile.X) + xFrac
+		tileY := float64(tile.Y) + yFrac
+
+		// Convert to longitude (simple linear)
+		lng := (tileX/n)*360.0 - 180.0
+
+		// Convert to latitude (inverse Mercator projection)
+		lat := math.Atan(math.Sinh(math.Pi*(1.0-2.0*tileY/n))) * (180.0 / math.Pi)
+
 		return orb.Point{lng, lat}
 	}
 
-	// Convert tile space coordinates to geographic coordinates
-	var bound orb.Bound
+	// Collect all points from geometry
+	var points []orb.Point
 
 	switch g := geom.(type) {
 	case orb.Point:
-		point := tileCoordToLatLng(g[0], g[1])
-		bound = orb.Bound{Min: point, Max: point}
+		points = append(points, tileCoordToLatLng(g[0], g[1]))
 	case orb.LineString:
 		for _, coord := range g {
-			point := tileCoordToLatLng(coord[0], coord[1])
-			bound = bound.Extend(point)
+			points = append(points, tileCoordToLatLng(coord[0], coord[1]))
 		}
 	case orb.Polygon:
 		for _, ring := range g {
 			for _, coord := range ring {
-				point := tileCoordToLatLng(coord[0], coord[1])
-				bound = bound.Extend(point)
+				points = append(points, tileCoordToLatLng(coord[0], coord[1]))
 			}
 		}
 	case orb.MultiLineString:
 		for _, line := range g {
 			for _, coord := range line {
-				point := tileCoordToLatLng(coord[0], coord[1])
-				bound = bound.Extend(point)
+				points = append(points, tileCoordToLatLng(coord[0], coord[1]))
 			}
 		}
 	case orb.MultiPolygon:
 		for _, poly := range g {
 			for _, ring := range poly {
 				for _, coord := range ring {
-					point := tileCoordToLatLng(coord[0], coord[1])
-					bound = bound.Extend(point)
+					points = append(points, tileCoordToLatLng(coord[0], coord[1]))
 				}
 			}
 		}
@@ -302,15 +352,60 @@ func (e *GeometryExtractor) calculateBounds(geom orb.Geometry, tile maptile.Tile
 		// Try to get bound from geometry if possible
 		if b := geom.Bound(); b.Left() != 0 || b.Right() != 0 {
 			// These are still tile coordinates, need to convert
-			minPoint := tileCoordToLatLng(b.Min[0], b.Min[1])
-			maxPoint := tileCoordToLatLng(b.Max[0], b.Max[1])
-			return &orb.Bound{Min: minPoint, Max: maxPoint}
+			// Note: In tile coords, b.Min[1] (small y) = north/top, b.Max[1] (large y) = south/bottom
+			// So we need to convert all 4 corners and recalculate proper geographic min/max
+			swPoint := tileCoordToLatLng(b.Min[0], b.Max[1]) // southwest: min x, max y
+			nePoint := tileCoordToLatLng(b.Max[0], b.Min[1]) // northeast: max x, min y
+
+			// Construct proper geographic bound
+			result := orb.Bound{
+				Min: orb.Point{swPoint.Lon(), swPoint.Lat()}, // min lng, min lat
+				Max: orb.Point{nePoint.Lon(), nePoint.Lat()}, // max lng, max lat
+			}
+			return &result
 		}
 		return nil
 	}
 
-	if bound.Left() == 0 && bound.Right() == 0 && bound.Top() == 0 && bound.Bottom() == 0 {
+	if len(points) == 0 {
 		return nil
+	}
+
+	// Manually calculate min/max from all points
+	minLng := points[0].Lon()
+	maxLng := points[0].Lon()
+	minLat := points[0].Lat()
+	maxLat := points[0].Lat()
+
+	for _, p := range points[1:] {
+		if p.Lon() < minLng {
+			minLng = p.Lon()
+		}
+		if p.Lon() > maxLng {
+			maxLng = p.Lon()
+		}
+		if p.Lat() < minLat {
+			minLat = p.Lat()
+		}
+		if p.Lat() > maxLat {
+			maxLat = p.Lat()
+		}
+	}
+
+	bound := orb.Bound{
+		Min: orb.Point{minLng, minLat},
+		Max: orb.Point{maxLng, maxLat},
+	}
+
+	// Debug: validate the bound - CHECK ALL 4 COORDINATES
+	if bound.Min.Lat() == 0 || bound.Max.Lat() == 0 || bound.Min.Lon() == 0 || bound.Max.Lon() == 0 {
+		e.logger.Warn("Invalid bound detected",
+			"minLng", minLng, "minLat", minLat,
+			"maxLng", maxLng, "maxLat", maxLat,
+			"bound.Min.Lat()", bound.Min.Lat(),
+			"bound.Max.Lat()", bound.Max.Lat(),
+			"bound.Min.Lon()", bound.Min.Lon(),
+			"bound.Max.Lon()", bound.Max.Lon())
 	}
 
 	return &bound
@@ -445,4 +540,13 @@ func (e *GeometryExtractor) CleanupExtractionFiles(region string) error {
 	os.Remove(extractionFile)
 
 	return nil
+}
+
+// getPropertyKeys returns all keys from a property map for debugging
+func getPropertyKeys(props map[string]interface{}) []string {
+	keys := make([]string, 0, len(props))
+	for k := range props {
+		keys = append(keys, k)
+	}
+	return keys
 }

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/maptile"
 )
 
@@ -333,4 +334,448 @@ func TestCleanupExtractionFiles(t *testing.T) {
 	if _, err := os.Stat(extractionFile); !os.IsNotExist(err) {
 		t.Error("Extraction file was not deleted")
 	}
+}
+
+// TestCalculateBoundsComprehensive tests the calculateBounds function thoroughly
+func TestBoundAccessors(t *testing.T) {
+	// Test to understand how orb.Bound accessors work
+	minLng := -123.5
+	minLat := 45.2
+	maxLng := -123.1
+	maxLat := 45.6
+
+	bound := orb.Bound{
+		Min: orb.Point{minLng, minLat},
+		Max: orb.Point{maxLng, maxLat},
+	}
+
+	t.Logf("Created bound with:")
+	t.Logf("  Min: orb.Point{%.6f, %.6f}", minLng, minLat)
+	t.Logf("  Max: orb.Point{%.6f, %.6f}", maxLng, maxLat)
+	t.Logf("")
+	t.Logf("Accessing via methods:")
+	t.Logf("  bound.Min.Lon() = %.6f (expected %.6f)", bound.Min.Lon(), minLng)
+	t.Logf("  bound.Min.Lat() = %.6f (expected %.6f)", bound.Min.Lat(), minLat)
+	t.Logf("  bound.Max.Lon() = %.6f (expected %.6f)", bound.Max.Lon(), maxLng)
+	t.Logf("  bound.Max.Lat() = %.6f (expected %.6f)", bound.Max.Lat(), maxLat)
+	t.Logf("")
+	t.Logf("Accessing via array indices:")
+	t.Logf("  bound.Min[0] = %.6f (should be Lon = %.6f)", bound.Min[0], minLng)
+	t.Logf("  bound.Min[1] = %.6f (should be Lat = %.6f)", bound.Min[1], minLat)
+	t.Logf("  bound.Max[0] = %.6f (should be Lon = %.6f)", bound.Max[0], maxLng)
+	t.Logf("  bound.Max[1] = %.6f (should be Lat = %.6f)", bound.Max[1], maxLat)
+
+	// Extract like the code does
+	extractedMinLat := bound.Min.Lat()
+	extractedMaxLat := bound.Max.Lat()
+	extractedMinLng := bound.Min.Lon()
+	extractedMaxLng := bound.Max.Lon()
+
+	t.Logf("")
+	t.Logf("Extracted values (as code does at line 248-251):")
+	t.Logf("  minLat = %.6f", extractedMinLat)
+	t.Logf("  maxLat = %.6f", extractedMaxLat)
+	t.Logf("  minLng = %.6f", extractedMinLng)
+	t.Logf("  maxLng = %.6f", extractedMaxLng)
+
+	// Check if any are zero
+	if extractedMinLat == 0 || extractedMaxLat == 0 || extractedMinLng == 0 || extractedMaxLng == 0 {
+		t.Errorf("BUG: Some extracted values are zero!")
+		t.Errorf("  minLat: %.6f", extractedMinLat)
+		t.Errorf("  maxLat: %.6f", extractedMaxLat)
+		t.Errorf("  minLng: %.6f", extractedMinLng)
+		t.Errorf("  maxLng: %.6f", extractedMaxLng)
+	}
+}
+
+func TestSingleTileExtraction(t *testing.T) {
+	extractor := NewGeometryExtractor()
+
+	// Test with a real tile file
+	tilePath := "test-tiles/test-region/9/66/157.pbf"
+
+	// Check if test tile exists
+	if _, err := os.Stat(tilePath); os.IsNotExist(err) {
+		t.Skip("Test tile not found at", tilePath)
+	}
+
+	// Parse tile coordinates from path
+	tile, err := extractor.parseTilePath(tilePath)
+	if err != nil {
+		t.Fatalf("Failed to parse tile path: %v", err)
+	}
+
+	t.Logf("Testing extraction from tile: %d/%d/%d", tile.Z, tile.X, tile.Y)
+
+	// Extract roads from this single tile
+	roads, invalidCount, err := extractor.extractRoadsFromTile(tilePath, "test-region", tile)
+	if err != nil {
+		t.Fatalf("Failed to extract roads: %v", err)
+	}
+
+	t.Logf("Extracted %d roads, %d invalid", len(roads), invalidCount)
+
+	// Show first few roads
+	for i, road := range roads {
+		if i >= 5 {
+			break
+		}
+		t.Logf("Road %d:", i)
+		t.Logf("  ID: %s", road.RoadID)
+		t.Logf("  Bounds: [%.6f, %.6f] to [%.6f, %.6f]",
+			road.MinLng, road.MinLat, road.MaxLng, road.MaxLat)
+		if road.Curvature != nil {
+			t.Logf("  Curvature: %s", *road.Curvature)
+		}
+	}
+
+	// Check if any roads have zero coordinates
+	zeroCount := 0
+	for _, road := range roads {
+		if road.MinLat == 0 || road.MaxLat == 0 || road.MinLng == 0 || road.MaxLng == 0 {
+			zeroCount++
+			if zeroCount <= 3 {
+				t.Errorf("Road has zero coordinates: %s [%.6f, %.6f] to [%.6f, %.6f]",
+					road.RoadID, road.MinLng, road.MinLat, road.MaxLng, road.MaxLat)
+			}
+		}
+	}
+	if zeroCount > 0 {
+		t.Errorf("Found %d roads with zero coordinates!", zeroCount)
+	}
+}
+
+// TestRoadSegmentBoundingBox - Test for debugging bounding box calculation for road segments
+// This test helps identify if the bounding box issue is in calculation or storage
+func TestRoadSegmentBoundingBox(t *testing.T) {
+	extractor := NewGeometryExtractor()
+
+	// Test case 1: Road segment in Oregon (typical use case)
+	t.Run("OregonRoadSegment", func(t *testing.T) {
+		// Tile coordinates for a typical Oregon road
+		tile := maptile.New(163, 357, 10) // z=10, x=163, y=357
+
+		// Get the geographic bounds of the tile itself
+		tileBound := tile.Bound()
+		t.Logf("Tile %d/%d/%d geographic bounds:", tile.Z, tile.X, tile.Y)
+		t.Logf("  SW corner (Min): %.6f°, %.6f°", tileBound.Min.Lon(), tileBound.Min.Lat())
+		t.Logf("  NE corner (Max): %.6f°, %.6f°", tileBound.Max.Lon(), tileBound.Max.Lat())
+		t.Logf("  Tile lat span: %.6f° (%.2f km)", tileBound.Max.Lat()-tileBound.Min.Lat(), (tileBound.Max.Lat()-tileBound.Min.Lat())*111.0)
+
+		// Simulate a road segment as LineString with tile coordinates (0-4096)
+		// This represents a diagonal road across the tile
+		roadGeometry := orb.LineString{
+			{512.0, 512.0},   // Point in tile space
+			{1024.0, 1024.0}, // Another point in tile space
+			{2048.0, 2048.0}, // Third point
+		}
+
+		t.Logf("\nRoad geometry in tile space (0-4096):")
+		for i, point := range roadGeometry {
+			t.Logf("  Point %d: x=%.1f, y=%.1f", i, point[0], point[1])
+		}
+
+		// Calculate bounds
+		bounds := extractor.calculateBounds(roadGeometry, tile)
+		if bounds == nil {
+			t.Fatal("calculateBounds returned nil")
+		}
+
+		// Extract coordinates as the code does
+		minLat := bounds.Min.Lat()
+		maxLat := bounds.Max.Lat()
+		minLng := bounds.Min.Lon()
+		maxLng := bounds.Max.Lon()
+
+		t.Logf("\nCalculated bounding box:")
+		t.Logf("  Min Lat: %.6f°", minLat)
+		t.Logf("  Max Lat: %.6f°", maxLat)
+		t.Logf("  Min Lng: %.6f°", minLng)
+		t.Logf("  Max Lng: %.6f°", maxLng)
+		t.Logf("\nBounding box dimensions:")
+		t.Logf("  Lat range: %.6f° (%.2f km)", maxLat-minLat, (maxLat-minLat)*111.0)
+		t.Logf("  Lng range: %.6f° (%.2f km)", maxLng-minLng, (maxLng-minLng)*111.0)
+
+		// Check if road bounds are reasonable compared to tile bounds
+		t.Logf("\nRoad bounds as percent of tile:")
+		t.Logf("  Lat: %.1f%% of tile height", (maxLat-minLat)/(tileBound.Max.Lat()-tileBound.Min.Lat())*100)
+		t.Logf("  Lng: %.1f%% of tile width", (maxLng-minLng)/(tileBound.Max.Lon()-tileBound.Min.Lon())*100)
+
+		// Validation checks
+		if minLat == 0 || maxLat == 0 || minLng == 0 || maxLng == 0 {
+			t.Errorf("ERROR: Zero coordinate detected!")
+			t.Errorf("  This indicates a bug in calculateBounds()")
+			t.Errorf("  minLat=%.6f, maxLat=%.6f, minLng=%.6f, maxLng=%.6f",
+				minLat, maxLat, minLng, maxLng)
+		}
+
+		// Check if bounds make sense
+		if minLat >= maxLat {
+			t.Errorf("ERROR: minLat (%.6f) >= maxLat (%.6f)", minLat, maxLat)
+		}
+		if minLng >= maxLng {
+			t.Errorf("ERROR: minLng (%.6f) >= maxLng (%.6f)", minLng, maxLng)
+		}
+
+		// Check if bounds are within tile bounds
+		if minLat < tileBound.Min.Lat() || maxLat > tileBound.Max.Lat() {
+			t.Errorf("WARNING: Latitude bounds extend outside tile bounds")
+			t.Errorf("  Road: [%.6f, %.6f]", minLat, maxLat)
+			t.Errorf("  Tile: [%.6f, %.6f]", tileBound.Min.Lat(), tileBound.Max.Lat())
+		}
+		if minLng < tileBound.Min.Lon() || maxLng > tileBound.Max.Lon() {
+			t.Errorf("WARNING: Longitude bounds extend outside tile bounds")
+			t.Errorf("  Road: [%.6f, %.6f]", minLng, maxLng)
+			t.Errorf("  Tile: [%.6f, %.6f]", tileBound.Min.Lon(), tileBound.Max.Lon())
+		}
+
+		// Validate coordinate ranges
+		if minLat < -90 || minLat > 90 || maxLat < -90 || maxLat > 90 {
+			t.Errorf("ERROR: Latitude out of range [-90, 90]")
+		}
+		if minLng < -180 || minLng > 180 || maxLng < -180 || maxLng > 180 {
+			t.Errorf("ERROR: Longitude out of range [-180, 180]")
+		}
+	})
+
+	// Test case 2: Very small road segment (single tile coordinate point)
+	t.Run("SmallRoadSegment", func(t *testing.T) {
+		tile := maptile.New(163, 357, 10)
+
+		// Very small road - just 2 points close together
+		roadGeometry := orb.LineString{
+			{2048.0, 2048.0},
+			{2049.0, 2049.0},
+		}
+
+		bounds := extractor.calculateBounds(roadGeometry, tile)
+		if bounds == nil {
+			t.Fatal("calculateBounds returned nil")
+		}
+
+		minLat := bounds.Min.Lat()
+		maxLat := bounds.Max.Lat()
+		minLng := bounds.Min.Lon()
+		maxLng := bounds.Max.Lon()
+
+		t.Logf("Small road segment bounds:")
+		t.Logf("  [%.8f, %.8f] to [%.8f, %.8f]", minLng, minLat, maxLng, maxLat)
+
+		if minLat == 0 || maxLat == 0 || minLng == 0 || maxLng == 0 {
+			t.Errorf("ERROR: Zero coordinate in small segment")
+		}
+
+		// The bounds should be very small but not zero
+		latRange := maxLat - minLat
+		lngRange := maxLng - minLng
+
+		t.Logf("  Lat range: %.8f° (%.2f meters)", latRange, latRange*111000)
+		t.Logf("  Lng range: %.8f° (%.2f meters)", lngRange, lngRange*111000)
+
+		if latRange == 0 || lngRange == 0 {
+			t.Logf("  WARNING: Zero range detected (might be too small)")
+		}
+	})
+
+	// Test case 3: Road at tile edges
+	t.Run("RoadAtTileEdges", func(t *testing.T) {
+		tile := maptile.New(163, 357, 10)
+
+		testCases := []struct {
+			name     string
+			geometry orb.LineString
+		}{
+			{
+				name: "Road at left edge",
+				geometry: orb.LineString{
+					{0.0, 2048.0},
+					{100.0, 2048.0},
+				},
+			},
+			{
+				name: "Road at right edge",
+				geometry: orb.LineString{
+					{3996.0, 2048.0},
+					{4096.0, 2048.0},
+				},
+			},
+			{
+				name: "Road at top edge",
+				geometry: orb.LineString{
+					{2048.0, 0.0},
+					{2048.0, 100.0},
+				},
+			},
+			{
+				name: "Road at bottom edge",
+				geometry: orb.LineString{
+					{2048.0, 3996.0},
+					{2048.0, 4096.0},
+				},
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				bounds := extractor.calculateBounds(tc.geometry, tile)
+				if bounds == nil {
+					t.Fatal("calculateBounds returned nil")
+				}
+
+				minLat := bounds.Min.Lat()
+				maxLat := bounds.Max.Lat()
+				minLng := bounds.Min.Lon()
+				maxLng := bounds.Max.Lon()
+
+				t.Logf("%s bounds: [%.6f, %.6f] to [%.6f, %.6f]",
+					tc.name, minLng, minLat, maxLng, maxLat)
+
+				if minLat == 0 || maxLat == 0 || minLng == 0 || maxLng == 0 {
+					t.Errorf("ERROR: Zero coordinate detected in %s", tc.name)
+				}
+			})
+		}
+	})
+}
+
+func TestCalculateBoundsComprehensive(t *testing.T) {
+	extractor := NewGeometryExtractor()
+
+	t.Run("TileCoordinateConversion", func(t *testing.T) {
+		// Test various tiles to understand the coordinate conversion
+		testCases := []struct {
+			name string
+			tile maptile.Tile
+		}{
+			{"Oregon tile", maptile.New(163, 357, 10)},
+			{"Equator crossing", maptile.New(512, 512, 10)}, // Should cross equator
+			{"Prime meridian crossing", maptile.New(512, 256, 10)}, // Should cross prime meridian
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				tileBound := tc.tile.Bound()
+				t.Logf("Tile %d/%d/%d bounds:", tc.tile.Z, tc.tile.X, tc.tile.Y)
+				t.Logf("  Geographic bounds: [%.6f, %.6f] to [%.6f, %.6f]",
+					tileBound.Min.Lon(), tileBound.Min.Lat(),
+					tileBound.Max.Lon(), tileBound.Max.Lat())
+
+				// Test with a simple LineString
+				geometry := orb.LineString{
+					{100.0, 100.0},
+					{200.0, 200.0},
+				}
+
+				bounds := extractor.calculateBounds(geometry, tc.tile)
+				if bounds == nil {
+					t.Fatal("Expected non-nil bounds")
+				}
+
+				t.Logf("  Calculated bounds: [%.6f, %.6f] to [%.6f, %.6f]",
+					bounds.Min.Lon(), bounds.Min.Lat(),
+					bounds.Max.Lon(), bounds.Max.Lat())
+
+				// Check if bounds are actually valid
+				if bounds.Min.Lat() > bounds.Max.Lat() {
+					t.Error("Invalid: Min.Lat > Max.Lat")
+				}
+				if bounds.Min.Lon() > bounds.Max.Lon() {
+					t.Error("Invalid: Min.Lon > Max.Lon")
+				}
+			})
+		}
+	})
+
+	t.Run("EdgeCases", func(t *testing.T) {
+		tile := maptile.New(163, 357, 10)
+
+		testCases := []struct {
+			name     string
+			geometry orb.Geometry
+		}{
+			{
+				name: "Point at tile origin (0,0)",
+				geometry: orb.Point{0.0, 0.0},
+			},
+			{
+				name: "Point at tile max (4096,4096)",
+				geometry: orb.Point{4096.0, 4096.0},
+			},
+			{
+				name: "LineString spanning full tile",
+				geometry: orb.LineString{
+					{0.0, 0.0},
+					{4096.0, 4096.0},
+				},
+			},
+			{
+				name: "Single point in middle",
+				geometry: orb.Point{2048.0, 2048.0},
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				bounds := extractor.calculateBounds(tc.geometry, tile)
+				if bounds == nil {
+					t.Fatal("Expected non-nil bounds")
+				}
+
+				t.Logf("Geometry: %s", tc.name)
+				t.Logf("  Bounds: [%.6f, %.6f] to [%.6f, %.6f]",
+					bounds.Min.Lon(), bounds.Min.Lat(),
+					bounds.Max.Lon(), bounds.Max.Lat())
+
+				// IMPORTANT: Zero IS a valid coordinate (equator/prime meridian)
+				// So we should NOT reject bounds just because they equal zero!
+				// Instead, check for truly invalid conditions:
+
+				// 1. Min should be <= Max
+				if bounds.Min.Lat() > bounds.Max.Lat() {
+					t.Errorf("INVALID: Min.Lat (%.6f) > Max.Lat (%.6f)",
+						bounds.Min.Lat(), bounds.Max.Lat())
+				}
+				if bounds.Min.Lon() > bounds.Max.Lon() {
+					t.Errorf("INVALID: Min.Lon (%.6f) > Max.Lon (%.6f)",
+						bounds.Min.Lon(), bounds.Max.Lon())
+				}
+
+				// 2. Latitude should be in valid range [-90, 90]
+				if bounds.Min.Lat() < -90 || bounds.Min.Lat() > 90 {
+					t.Errorf("INVALID: Min.Lat (%.6f) out of range [-90, 90]", bounds.Min.Lat())
+				}
+				if bounds.Max.Lat() < -90 || bounds.Max.Lat() > 90 {
+					t.Errorf("INVALID: Max.Lat (%.6f) out of range [-90, 90]", bounds.Max.Lat())
+				}
+
+				// 3. Longitude should be in valid range [-180, 180]
+				if bounds.Min.Lon() < -180 || bounds.Min.Lon() > 180 {
+					t.Errorf("INVALID: Min.Lon (%.6f) out of range [-180, 180]", bounds.Min.Lon())
+				}
+				if bounds.Max.Lon() < -180 || bounds.Max.Lon() > 180 {
+					t.Errorf("INVALID: Max.Lon (%.6f) out of range [-180, 180]", bounds.Max.Lon())
+				}
+			})
+		}
+	})
+
+	t.Run("ZeroIsValidCoordinate", func(t *testing.T) {
+		// Demonstrate that zero IS a valid coordinate
+		// 0° latitude = equator, 0° longitude = prime meridian
+
+		// Tile that should cross the equator
+		equatorTile := maptile.New(512, 512, 10)
+		tileBound := equatorTile.Bound()
+
+		t.Logf("Equator-crossing tile bounds: [%.6f, %.6f] to [%.6f, %.6f]",
+			tileBound.Min.Lon(), tileBound.Min.Lat(),
+			tileBound.Max.Lon(), tileBound.Max.Lat())
+
+		// If the tile crosses the equator, one of the latitude bounds might be near zero
+		// This is VALID and should not be rejected!
+		if tileBound.Min.Lat() < 0 && tileBound.Max.Lat() > 0 {
+			t.Log("✓ This tile crosses the equator (lat bounds span zero)")
+			t.Log("  Zero latitude is VALID - it's the equator!")
+		}
+	})
 }
