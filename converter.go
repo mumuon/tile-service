@@ -23,108 +23,91 @@ func ConvertKMLToGeoJSON(ctx context.Context, kmlPath, region string) (string, i
 		return "", 0, fmt.Errorf("failed to read KML file: %w", err)
 	}
 
-	// Parse KML - handle both Document>Folder>Placemark and Document>Folder>Folder>Placemark structures
+	// Parse KML - structure is: kml > Document > Folder > Placemark > LineString
+	// Each Folder represents one road with multiple Placemarks (road segments)
+	// Note: KML files use the namespace "http://www.opengis.net/kml/2.2" - must be specified on ALL elements
 	var doc struct {
-		XMLName xml.Name
-		Folders []struct {
-			Name        string `xml:"name"`
-			Folders     []struct {
-				Name        string `xml:"name"`
+		XMLName  xml.Name `xml:"http://www.opengis.net/kml/2.2 kml"`
+		Document struct {
+			Folders []struct {
+				Name        string `xml:"http://www.opengis.net/kml/2.2 name"`
+				Description string `xml:"http://www.opengis.net/kml/2.2 description"`
 				Placemarks  []struct {
-					Name       string `xml:"name"`
+					Name       string `xml:"http://www.opengis.net/kml/2.2 name"`
 					LineString struct {
-						Coordinates string `xml:"coordinates"`
-					} `xml:"LineString"`
-					Polygon struct {
-						OuterBoundaryIs struct {
-							LinearRing struct {
-								Coordinates string `xml:"coordinates"`
-							} `xml:"LinearRing"`
-						} `xml:"outerBoundaryIs"`
-					} `xml:"Polygon"`
-				} `xml:"Placemark"`
-			} `xml:"Folder"`
-			Placemarks []struct {
-				Name       string `xml:"name"`
-				LineString struct {
-					Coordinates string `xml:"coordinates"`
-				} `xml:"LineString"`
-				Polygon struct {
-					OuterBoundaryIs struct {
-						LinearRing struct {
-							Coordinates string `xml:"coordinates"`
-						} `xml:"LinearRing"`
-					} `xml:"outerBoundaryIs"`
-				} `xml:"Polygon"`
-			} `xml:"Placemark"`
-		} `xml:"Document>Folder"`
+						Coordinates string `xml:"http://www.opengis.net/kml/2.2 coordinates"`
+					} `xml:"http://www.opengis.net/kml/2.2 LineString"`
+				} `xml:"http://www.opengis.net/kml/2.2 Placemark"`
+			} `xml:"http://www.opengis.net/kml/2.2 Folder"`
+		} `xml:"http://www.opengis.net/kml/2.2 Document"`
 	}
 
 	if err := xml.Unmarshal(kmlContent, &doc); err != nil {
 		return "", 0, fmt.Errorf("failed to parse KML: %w", err)
 	}
 
-	logger.Debug("KML parsed", "folders", len(doc.Folders))
+	logger.Debug("KML parsed", "folders", len(doc.Document.Folders))
 
 	// Build GeoJSON FeatureCollection
 	features := make([]map[string]interface{}, 0)
+	roadCount := 0
 
-	for _, folder := range doc.Folders {
-		// Process placemarks directly in the folder
+	// Process each Folder (each folder = one road with multiple segments)
+	for _, folder := range doc.Document.Folders {
+		// Get folder name with fallback
+		folderName := folder.Name
+		if folderName == "" {
+			folderName = fmt.Sprintf("Road_%d", roadCount)
+			roadCount++
+		}
+
+		// Collect all LineStrings from all Placemarks in this folder
+		var lineStrings [][][]float64
+
 		for _, pm := range folder.Placemarks {
-			var coords [][]float64
-			if pm.LineString.Coordinates != "" {
-				coords = parseKMLCoordinates(pm.LineString.Coordinates)
-			}
-			if pm.Polygon.OuterBoundaryIs.LinearRing.Coordinates != "" {
-				coords = parseKMLCoordinates(pm.Polygon.OuterBoundaryIs.LinearRing.Coordinates)
-			}
-			if len(coords) == 0 {
+			// Extract LineString coordinates
+			if pm.LineString.Coordinates == "" {
 				continue
 			}
 
-			feature := map[string]interface{}{
-				"type": "Feature",
-				"properties": map[string]interface{}{
-					"Name":   pm.Name,
-					"Folder": folder.Name,
-				},
-				"geometry": map[string]interface{}{
-					"type":        "LineString",
-					"coordinates": coords,
-				},
+			coords := parseKMLCoordinates(pm.LineString.Coordinates)
+			if len(coords) < 2 {
+				continue
 			}
-			features = append(features, feature)
+
+			lineStrings = append(lineStrings, coords)
 		}
 
-		// Process placemarks in nested folders
-		for _, subfolder := range folder.Folders {
-			for _, pm := range subfolder.Placemarks {
-				var coords [][]float64
-				if pm.LineString.Coordinates != "" {
-					coords = parseKMLCoordinates(pm.LineString.Coordinates)
-				}
-				if pm.Polygon.OuterBoundaryIs.LinearRing.Coordinates != "" {
-					coords = parseKMLCoordinates(pm.Polygon.OuterBoundaryIs.LinearRing.Coordinates)
-				}
-				if len(coords) == 0 {
-					continue
-				}
+		// Skip if no valid geometries found
+		if len(lineStrings) == 0 {
+			continue
+		}
 
-				feature := map[string]interface{}{
-					"type": "Feature",
-					"properties": map[string]interface{}{
-						"Name":   pm.Name,
-						"Folder": subfolder.Name,
-					},
-					"geometry": map[string]interface{}{
-						"type":        "LineString",
-						"coordinates": coords,
-					},
-				}
-				features = append(features, feature)
+		// Create ONE feature per road (folder) with MultiLineString geometry
+		var geometry map[string]interface{}
+		if len(lineStrings) == 1 {
+			// Single segment - use LineString
+			geometry = map[string]interface{}{
+				"type":        "LineString",
+				"coordinates": lineStrings[0],
+			}
+		} else {
+			// Multiple segments - use MultiLineString
+			geometry = map[string]interface{}{
+				"type":        "MultiLineString",
+				"coordinates": lineStrings,
 			}
 		}
+
+		feature := map[string]interface{}{
+			"type": "Feature",
+			"properties": map[string]interface{}{
+				"Name": folderName, // Road name from folder
+				// Description omitted to reduce file size
+			},
+			"geometry": geometry,
+		}
+		features = append(features, feature)
 	}
 
 	logger.Info("features extracted from KML", "count", len(features))
@@ -181,5 +164,4 @@ func parseKMLCoordinates(coordString string) [][]float64 {
 		coordinates = append(coordinates, []float64{lng, lat})
 	}
 
-	return coordinates
-}
+	return coordinates}
