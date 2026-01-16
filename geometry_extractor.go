@@ -18,13 +18,19 @@ import (
 
 // RoadGeometry represents a road's bounding box extracted from tiles
 type RoadGeometry struct {
-	RoadID    string  `json:"roadId"`
-	Region    string  `json:"region"`
-	MinLat    float64 `json:"minLat"`
-	MaxLat    float64 `json:"maxLat"`
-	MinLng    float64 `json:"minLng"`
-	MaxLng    float64 `json:"maxLng"`
-	Curvature *string `json:"curvature,omitempty"`
+	RoadID    string   `json:"roadId"`
+	Name      string   `json:"name"`
+	Region    string   `json:"region"`
+	MinLat    float64  `json:"minLat"`
+	MaxLat    float64  `json:"maxLat"`
+	MinLng    float64  `json:"minLng"`
+	MaxLng    float64  `json:"maxLng"`
+	Curvature *string  `json:"curvature,omitempty"`
+	Length    *float64 `json:"length,omitempty"`
+	StartLat  *float64 `json:"startLat,omitempty"`
+	StartLng  *float64 `json:"startLng,omitempty"`
+	EndLat    *float64 `json:"endLat,omitempty"`
+	EndLng    *float64 `json:"endLng,omitempty"`
 }
 
 // ExtractionProgress tracks the extraction process
@@ -214,28 +220,27 @@ func (e *GeometryExtractor) extractRoadsFromTile(pbfFile, region string, tileCoo
 
 		// Process each feature
 		for featureIdx, feature := range layer.Features {
-			// DEBUG: Log first 3 features' properties to see what's available
-			if featureIdx < 3 {
-				e.logger.Info("DEBUG: Feature properties in tile",
-					"tile", fmt.Sprintf("%d/%d/%d", tileCoords.Z, tileCoords.X, tileCoords.Y),
-					"featureIdx", featureIdx,
-					"properties", feature.Properties,
-					"propertyKeys", getPropertyKeys(feature.Properties))
-			}
-
-			// Get road name/ID - include region prefix to avoid collisions across regions
+			// Get road UUID - this is the primary unique identifier
 			roadID := ""
-			if name, ok := feature.Properties["Name"].(string); ok && name != "" {
-				roadID = fmt.Sprintf("%s_%s", region, name)
+			if id, ok := feature.Properties["id"].(string); ok && id != "" {
+				// Use the UUID from the GeoJSON (generated during conversion)
+				roadID = id
 			}
 			if roadID == "" {
-				if id, ok := feature.Properties["id"].(string); ok && id != "" {
-					roadID = fmt.Sprintf("%s_%s", region, id)
+				// Fallback: use name with region prefix
+				if name, ok := feature.Properties["Name"].(string); ok && name != "" {
+					roadID = fmt.Sprintf("%s_%s", region, name)
 				}
 			}
 			if roadID == "" {
-				// Generate unique ID from tile coordinates and feature index
+				// Last resort: generate from tile coordinates
 				roadID = fmt.Sprintf("%s_road_%d_%d_%d_%d", region, tileCoords.Z, tileCoords.X, tileCoords.Y, featureIdx)
+			}
+
+			// Get road name
+			roadName := ""
+			if name, ok := feature.Properties["Name"].(string); ok {
+				roadName = name
 			}
 
 			// Get curvature if available
@@ -245,6 +250,30 @@ func (e *GeometryExtractor) extractRoadsFromTile(pbfFile, region string, tileCoo
 			} else if curv, ok := feature.Properties["curvature"].(float64); ok {
 				curvStr := fmt.Sprintf("%.2f", curv)
 				curvature = &curvStr
+			}
+
+			// Get length if available
+			var length *float64
+			if len, ok := feature.Properties["length"].(float64); ok && len > 0 {
+				length = &len
+			}
+
+			// Get start point if available
+			var startLat, startLng *float64
+			if lat, ok := feature.Properties["startLat"].(float64); ok {
+				startLat = &lat
+			}
+			if lng, ok := feature.Properties["startLng"].(float64); ok {
+				startLng = &lng
+			}
+
+			// Get end point if available
+			var endLat, endLng *float64
+			if lat, ok := feature.Properties["endLat"].(float64); ok {
+				endLat = &lat
+			}
+			if lng, ok := feature.Properties["endLng"].(float64); ok {
+				endLng = &lng
 			}
 
 			// Convert tile coordinates to lat/lng bounds
@@ -276,12 +305,18 @@ func (e *GeometryExtractor) extractRoadsFromTile(pbfFile, region string, tileCoo
 
 			roads = append(roads, RoadGeometry{
 				RoadID:    roadID,
+				Name:      roadName,
 				Region:    region,
 				MinLat:    minLat,
 				MaxLat:    maxLat,
 				MinLng:    minLng,
 				MaxLng:    maxLng,
 				Curvature: curvature,
+				Length:    length,
+				StartLat:  startLat,
+				StartLng:  startLng,
+				EndLat:    endLat,
+				EndLng:    endLng,
 			})
 		}
 	}
@@ -542,11 +577,3 @@ func (e *GeometryExtractor) CleanupExtractionFiles(region string) error {
 	return nil
 }
 
-// getPropertyKeys returns all keys from a property map for debugging
-func getPropertyKeys(props map[string]interface{}) []string {
-	keys := make([]string, 0, len(props))
-	for k := range props {
-		keys = append(keys, k)
-	}
-	return keys
-}
