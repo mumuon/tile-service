@@ -207,8 +207,9 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-// removeDirectoryContents removes all contents of a directory, handling stubborn files like .DS_Store
-// This is more robust than os.RemoveAll which can fail on non-empty directories
+// removeDirectoryContents removes all contents of a directory except .DS_Store files
+// We skip .DS_Store because macOS recreates them constantly, causing race conditions
+// The root directory is preserved to avoid race conditions with Finder
 func removeDirectoryContents(dir string) error {
 	// Check if directory exists
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
@@ -226,6 +227,10 @@ func removeDirectoryContents(dir string) error {
 		if path == dir {
 			return nil // Skip the root directory itself
 		}
+		// Skip .DS_Store files - macOS recreates them constantly
+		if filepath.Base(path) == ".DS_Store" {
+			return nil
+		}
 		if info.IsDir() {
 			dirs = append(dirs, path)
 		} else {
@@ -239,21 +244,15 @@ func removeDirectoryContents(dir string) error {
 
 	// Remove all files first
 	for _, file := range files {
-		if err := os.Remove(file); err != nil {
+		if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to remove file %s: %w", file, err)
 		}
 	}
 
 	// Remove directories in reverse order (deepest first)
+	// Ignore errors for directories that may have .DS_Store files
 	for i := len(dirs) - 1; i >= 0; i-- {
-		if err := os.Remove(dirs[i]); err != nil {
-			return fmt.Errorf("failed to remove directory %s: %w", dirs[i], err)
-		}
-	}
-
-	// Finally remove the root directory
-	if err := os.Remove(dir); err != nil {
-		return fmt.Errorf("failed to remove root directory %s: %w", dir, err)
+		os.Remove(dirs[i]) // Best effort - may fail if .DS_Store exists
 	}
 
 	return nil
