@@ -6,10 +6,14 @@ import (
 	"encoding/xml"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // ConvertKMLToGeoJSON converts a KML file to GeoJSON format
@@ -99,14 +103,46 @@ func ConvertKMLToGeoJSON(ctx context.Context, kmlPath, region string) (string, i
 			}
 		}
 
+		// Calculate road metrics
+		roadLength := calculateRoadLength(geometry)
+		startLat, startLng, endLat, endLng, hasPoints := extractStartEndPoints(geometry)
+		curvature := parseCurvature(folder.Description)
+
+		// Generate deterministic UUID based on region + start coordinates
+		// This ensures the same road gets the same UUID across processing runs
+		var roadUUID string
+		if hasPoints {
+			// Create deterministic UUID v5 using region + start coords
+			namespace := uuid.MustParse("6ba7b810-9dad-11d1-80b4-00c04fd430c8") // DNS namespace
+			name := fmt.Sprintf("%s:%.6f,%.6f", region, startLat, startLng)
+			roadUUID = uuid.NewSHA1(namespace, []byte(name)).String()
+		} else {
+			// Fallback to random UUID if no coordinates available
+			roadUUID = uuid.New().String()
+		}
+
 		feature := map[string]interface{}{
 			"type": "Feature",
 			"properties": map[string]interface{}{
-				"Name": folderName, // Road name from folder
-				// Description omitted to reduce file size
+				"id":     roadUUID,
+				"Name":   folderName,
+				"length": roadLength,
 			},
 			"geometry": geometry,
 		}
+
+		// Add optional properties
+		if curvature != nil {
+			feature["properties"].(map[string]interface{})["curvature"] = *curvature
+		}
+		if hasPoints {
+			props := feature["properties"].(map[string]interface{})
+			props["startLat"] = startLat
+			props["startLng"] = startLng
+			props["endLat"] = endLat
+			props["endLng"] = endLng
+		}
+
 		features = append(features, feature)
 	}
 
@@ -164,4 +200,123 @@ func parseKMLCoordinates(coordString string) [][]float64 {
 		coordinates = append(coordinates, []float64{lng, lat})
 	}
 
-	return coordinates}
+	return coordinates
+}
+
+// haversineDistance calculates distance between two points in meters
+func haversineDistance(lat1, lng1, lat2, lng2 float64) float64 {
+	const earthRadius = 6371000.0 // meters
+
+	lat1Rad := lat1 * math.Pi / 180
+	lat2Rad := lat2 * math.Pi / 180
+	deltaLat := (lat2 - lat1) * math.Pi / 180
+	deltaLng := (lng2 - lng1) * math.Pi / 180
+
+	a := math.Sin(deltaLat/2)*math.Sin(deltaLat/2) +
+		math.Cos(lat1Rad)*math.Cos(lat2Rad)*
+			math.Sin(deltaLng/2)*math.Sin(deltaLng/2)
+
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+
+	return earthRadius * c
+}
+
+// calculateLineStringLength calculates length of a LineString using Haversine
+func calculateLineStringLength(coords [][]float64) float64 {
+	if len(coords) < 2 {
+		return 0.0
+	}
+
+	totalLength := 0.0
+	for i := 0; i < len(coords)-1; i++ {
+		lng1, lat1 := coords[i][0], coords[i][1]
+		lng2, lat2 := coords[i+1][0], coords[i+1][1]
+		totalLength += haversineDistance(lat1, lng1, lat2, lng2)
+	}
+	return totalLength
+}
+
+// calculateRoadLength calculates total length of road in meters
+func calculateRoadLength(geometry map[string]interface{}) float64 {
+	geomType, ok := geometry["type"].(string)
+	if !ok {
+		return 0.0
+	}
+
+	if geomType == "LineString" {
+		coords, ok := geometry["coordinates"].([][]float64)
+		if !ok {
+			return 0.0
+		}
+		return calculateLineStringLength(coords)
+	} else if geomType == "MultiLineString" {
+		coordsArray, ok := geometry["coordinates"].([][][]float64)
+		if !ok {
+			return 0.0
+		}
+		totalLength := 0.0
+		for _, coords := range coordsArray {
+			totalLength += calculateLineStringLength(coords)
+		}
+		return totalLength
+	}
+	return 0.0
+}
+
+// extractStartEndPoints gets start and end coordinates from geometry
+func extractStartEndPoints(geometry map[string]interface{}) (startLat, startLng, endLat, endLng float64, ok bool) {
+	geomType, typeOk := geometry["type"].(string)
+	if !typeOk {
+		return 0, 0, 0, 0, false
+	}
+
+	if geomType == "LineString" {
+		coords, coordsOk := geometry["coordinates"].([][]float64)
+		if !coordsOk || len(coords) < 2 {
+			return 0, 0, 0, 0, false
+		}
+		startLng, startLat = coords[0][0], coords[0][1]
+		endLng, endLat = coords[len(coords)-1][0], coords[len(coords)-1][1]
+		return startLat, startLng, endLat, endLng, true
+	} else if geomType == "MultiLineString" {
+		coordsArray, coordsOk := geometry["coordinates"].([][][]float64)
+		if !coordsOk || len(coordsArray) == 0 {
+			return 0, 0, 0, 0, false
+		}
+
+		firstSegment := coordsArray[0]
+		lastSegment := coordsArray[len(coordsArray)-1]
+
+		if len(firstSegment) == 0 || len(lastSegment) == 0 {
+			return 0, 0, 0, 0, false
+		}
+
+		startLng, startLat = firstSegment[0][0], firstSegment[0][1]
+		endLng, endLat = lastSegment[len(lastSegment)-1][0], lastSegment[len(lastSegment)-1][1]
+		return startLat, startLng, endLat, endLng, true
+	}
+
+	return 0, 0, 0, 0, false
+}
+
+// parseCurvature extracts curvature value from KML description
+// Looks for patterns like "c_1000" or "curvature: 1000"
+func parseCurvature(description string) *string {
+	if description == "" {
+		return nil
+	}
+
+	// Look for c_XXX pattern (e.g., "c_1000")
+	re := regexp.MustCompile(`c_(\d+)`)
+	if matches := re.FindStringSubmatch(description); len(matches) > 1 {
+		return &matches[1]
+	}
+
+	// Look for "curvature: XXX" pattern
+	re2 := regexp.MustCompile(`curvature:\s*(\d+)`)
+	if matches := re2.FindStringSubmatch(description); len(matches) > 1 {
+		return &matches[1]
+	}
+
+	return nil
+}

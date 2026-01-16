@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"log/slog"
 	"strings"
 	"time"
@@ -53,7 +54,9 @@ func (d *Database) Close() error {
 // GetPendingJobs retrieves pending jobs from the database
 func (d *Database) GetPendingJobs(ctx context.Context, limit int) ([]*TileJob, error) {
 	query := `
-		SELECT id, region, status, "currentStep", "roadsExtracted", "tilesGenerated",
+		SELECT id, region, status, "maxZoom", "minZoom", "skipUpload", "skipGeneration",
+		       "noCleanup", "extractGeometry", "skipGeometryInsertion",
+		       "currentStep", "roadsExtracted", "tilesGenerated",
 		       "totalSizeBytes", "uploadProgress", "uploadedBytes", "errorMessage", "errorLog",
 		       "createdAt", "updatedAt", "startedAt", "completedAt"
 		FROM "TileJob"
@@ -71,8 +74,10 @@ func (d *Database) GetPendingJobs(ctx context.Context, limit int) ([]*TileJob, e
 	for rows.Next() {
 		job := &TileJob{}
 		err := rows.Scan(
-			&job.ID, &job.Region, &job.Status, &job.CurrentStep,
-			&job.RoadsExtracted, &job.TilesGenerated,
+			&job.ID, &job.Region, &job.Status, &job.MaxZoom, &job.MinZoom,
+			&job.SkipUpload, &job.SkipGeneration, &job.NoCleanup,
+			&job.ExtractGeometry, &job.SkipGeometryInsertion,
+			&job.CurrentStep, &job.RoadsExtracted, &job.TilesGenerated,
 			&job.TotalSizeBytes, &job.UploadProgress, &job.UploadedBytes,
 			&job.ErrorMessage, &job.ErrorLog,
 			&job.CreatedAt, &job.UpdatedAt, &job.StartedAt, &job.CompletedAt,
@@ -184,7 +189,9 @@ func (d *Database) CompleteJob(ctx context.Context, jobID string, roadsExtracted
 // GetJobByID retrieves a specific job by ID
 func (d *Database) GetJobByID(ctx context.Context, jobID string) (*TileJob, error) {
 	query := `
-		SELECT id, region, status, "currentStep", "roadsExtracted", "tilesGenerated",
+		SELECT id, region, status, "maxZoom", "minZoom", "skipUpload", "skipGeneration",
+		       "noCleanup", "extractGeometry", "skipGeometryInsertion",
+		       "currentStep", "roadsExtracted", "tilesGenerated",
 		       "totalSizeBytes", "uploadProgress", "uploadedBytes", "errorMessage", "errorLog",
 		       "createdAt", "updatedAt", "startedAt", "completedAt"
 		FROM "TileJob"
@@ -193,8 +200,10 @@ func (d *Database) GetJobByID(ctx context.Context, jobID string) (*TileJob, erro
 
 	job := &TileJob{}
 	err := d.conn.QueryRowContext(ctx, query, jobID).Scan(
-		&job.ID, &job.Region, &job.Status, &job.CurrentStep,
-		&job.RoadsExtracted, &job.TilesGenerated,
+		&job.ID, &job.Region, &job.Status, &job.MaxZoom, &job.MinZoom,
+		&job.SkipUpload, &job.SkipGeneration, &job.NoCleanup,
+		&job.ExtractGeometry, &job.SkipGeometryInsertion,
+		&job.CurrentStep, &job.RoadsExtracted, &job.TilesGenerated,
 		&job.TotalSizeBytes, &job.UploadProgress, &job.UploadedBytes,
 		&job.ErrorMessage, &job.ErrorLog,
 		&job.CreatedAt, &job.UpdatedAt, &job.StartedAt, &job.CompletedAt,
@@ -213,22 +222,41 @@ func (d *Database) GetJobByID(ctx context.Context, jobID string) (*TileJob, erro
 // UpsertRoadGeometry inserts or updates a road geometry record
 func (d *Database) UpsertRoadGeometry(ctx context.Context, road *RoadGeometry) error {
 	query := `
-		INSERT INTO "RoadGeometry" (id, "roadId", region, "minLat", "maxLat", "minLng", "maxLng", curvature, "createdAt", "updatedAt")
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+		INSERT INTO "RoadGeometry" (
+			id, "roadId", name, region,
+			"minLat", "maxLat", "minLng", "maxLng",
+			curvature, length,
+			"startLat", "startLng", "endLat", "endLng",
+			"createdAt", "updatedAt"
+		)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
 		ON CONFLICT ("roadId", region)
 		DO UPDATE SET
-			"minLat" = EXCLUDED."minLat",
-			"maxLat" = EXCLUDED."maxLat",
-			"minLng" = EXCLUDED."minLng",
-			"maxLng" = EXCLUDED."maxLng",
-			curvature = EXCLUDED.curvature,
+			name = COALESCE(EXCLUDED.name, "RoadGeometry".name),
+			"minLat" = LEAST("RoadGeometry"."minLat", EXCLUDED."minLat"),
+			"maxLat" = GREATEST("RoadGeometry"."maxLat", EXCLUDED."maxLat"),
+			"minLng" = LEAST("RoadGeometry"."minLng", EXCLUDED."minLng"),
+			"maxLng" = GREATEST("RoadGeometry"."maxLng", EXCLUDED."maxLng"),
+			curvature = COALESCE(EXCLUDED.curvature, "RoadGeometry".curvature),
+			length = COALESCE(EXCLUDED.length, "RoadGeometry".length),
+			"startLat" = COALESCE(EXCLUDED."startLat", "RoadGeometry"."startLat"),
+			"startLng" = COALESCE(EXCLUDED."startLng", "RoadGeometry"."startLng"),
+			"endLat" = COALESCE(EXCLUDED."endLat", "RoadGeometry"."endLat"),
+			"endLng" = COALESCE(EXCLUDED."endLng", "RoadGeometry"."endLng"),
 			"updatedAt" = NOW()
 	`
 
+	// Debug: log what we're about to insert
+	if road.MinLat == 0 || road.MaxLng == 0 {
+		log.Printf("WARNING: Inserting road with zero coordinates: roadId=%s region=%s minLat=%f maxLat=%f minLng=%f maxLng=%f",
+			road.RoadID, road.Region, road.MinLat, road.MaxLat, road.MinLng, road.MaxLng)
+	}
+
 	_, err := d.conn.ExecContext(ctx, query,
-		road.RoadID, road.Region,
+		road.RoadID, road.Name, road.Region,
 		road.MinLat, road.MaxLat, road.MinLng, road.MaxLng,
-		road.Curvature,
+		road.Curvature, road.Length,
+		road.StartLat, road.StartLng, road.EndLat, road.EndLng,
 	)
 
 	if err != nil {
@@ -245,9 +273,10 @@ func (d *Database) BatchUpsertRoadGeometries(ctx context.Context, roads []RoadGe
 	logger.Info("starting optimized batch upsert of road geometries")
 
 	// PostgreSQL parameter limit: 65535 parameters max per query
-	// Each road needs 7 parameters, so max batch size = 65535 / 7 = 9362
-	// Use 9000 for safety margin
-	const maxBatchSize = 9000
+	// Each road needs 13 parameters (roadId, name, region, 4 bounds, curvature, length, 4 coords)
+	// Max batch size = 65535 / 13 = 5041
+	// Use 5000 for safety margin
+	const maxBatchSize = 5000
 	if batchSize < 5000 {
 		batchSize = 5000
 	}
@@ -282,31 +311,45 @@ func (d *Database) BatchUpsertRoadGeometries(ctx context.Context, roads []RoadGe
 
 		// Build multi-row INSERT statement
 		valuesStrings := make([]string, 0, len(batch))
-		valueArgs := make([]interface{}, 0, len(batch)*7)
+		valueArgs := make([]interface{}, 0, len(batch)*13)
 
 		for idx, road := range batch {
-			basePos := idx * 7
+			basePos := idx * 13
 			valuesStrings = append(valuesStrings,
-				fmt.Sprintf("(gen_random_uuid(), $%d, $%d, $%d, $%d, $%d, $%d, $%d, NOW(), NOW())",
-					basePos+1, basePos+2, basePos+3, basePos+4, basePos+5, basePos+6, basePos+7))
+				fmt.Sprintf("(gen_random_uuid(), $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, NOW(), NOW())",
+					basePos+1, basePos+2, basePos+3, basePos+4, basePos+5, basePos+6,
+					basePos+7, basePos+8, basePos+9, basePos+10, basePos+11, basePos+12, basePos+13))
 
 			valueArgs = append(valueArgs,
-				road.RoadID, road.Region,
+				road.RoadID, road.Name, road.Region,
 				road.MinLat, road.MaxLat, road.MinLng, road.MaxLng,
-				road.Curvature,
+				road.Curvature, road.Length,
+				road.StartLat, road.StartLng, road.EndLat, road.EndLng,
 			)
 		}
 
 		query := fmt.Sprintf(`
-			INSERT INTO "RoadGeometry" (id, "roadId", region, "minLat", "maxLat", "minLng", "maxLng", curvature, "createdAt", "updatedAt")
+			INSERT INTO "RoadGeometry" (
+				id, "roadId", name, region,
+				"minLat", "maxLat", "minLng", "maxLng",
+				curvature, length,
+				"startLat", "startLng", "endLat", "endLng",
+				"createdAt", "updatedAt"
+			)
 			VALUES %s
 			ON CONFLICT ("roadId", region)
 			DO UPDATE SET
-				"minLat" = EXCLUDED."minLat",
-				"maxLat" = EXCLUDED."maxLat",
-				"minLng" = EXCLUDED."minLng",
-				"maxLng" = EXCLUDED."maxLng",
-				curvature = EXCLUDED.curvature,
+				name = COALESCE(EXCLUDED.name, "RoadGeometry".name),
+				"minLat" = LEAST("RoadGeometry"."minLat", EXCLUDED."minLat"),
+				"maxLat" = GREATEST("RoadGeometry"."maxLat", EXCLUDED."maxLat"),
+				"minLng" = LEAST("RoadGeometry"."minLng", EXCLUDED."minLng"),
+				"maxLng" = GREATEST("RoadGeometry"."maxLng", EXCLUDED."maxLng"),
+				curvature = COALESCE(EXCLUDED.curvature, "RoadGeometry".curvature),
+				length = COALESCE(EXCLUDED.length, "RoadGeometry".length),
+				"startLat" = COALESCE(EXCLUDED."startLat", "RoadGeometry"."startLat"),
+				"startLng" = COALESCE(EXCLUDED."startLng", "RoadGeometry"."startLng"),
+				"endLat" = COALESCE(EXCLUDED."endLat", "RoadGeometry"."endLat"),
+				"endLng" = COALESCE(EXCLUDED."endLng", "RoadGeometry"."endLng"),
 				"updatedAt" = NOW()
 		`, strings.Join(valuesStrings, ", "))
 

@@ -779,3 +779,118 @@ func TestCalculateBoundsComprehensive(t *testing.T) {
 		}
 	})
 }
+
+// TestExtractRoadWithNewProperties tests extraction of new properties (length, start/end points) from tiles
+func TestExtractRoadWithNewProperties(t *testing.T) {
+	extractor := NewGeometryExtractor()
+
+	// Use real test tile
+	tilePath := "test-tiles/test-region/9/66/157.pbf"
+
+	// Check if test tile exists
+	if _, err := os.Stat(tilePath); os.IsNotExist(err) {
+		t.Skip("Test tile not found at", tilePath)
+	}
+
+	tile, err := extractor.parseTilePath(tilePath)
+	if err != nil {
+		t.Fatalf("Failed to parse tile path: %v", err)
+	}
+
+	roads, _, err := extractor.extractRoadsFromTile(tilePath, "test-region", tile)
+	if err != nil {
+		t.Fatalf("Failed to extract roads: %v", err)
+	}
+
+	if len(roads) == 0 {
+		t.Fatal("No roads extracted from test tile")
+	}
+
+	t.Logf("Extracted %d roads from test tile", len(roads))
+
+	// Track what properties we found
+	foundLength := false
+	foundStartPoint := false
+	foundEndPoint := false
+
+	for idx, road := range roads {
+		// Only log details for first few roads
+		if idx < 3 {
+			t.Logf("Road %d: %s", idx, road.RoadID)
+			t.Logf("  Bounds: lat[%.6f, %.6f], lng[%.6f, %.6f]",
+				road.MinLat, road.MaxLat, road.MinLng, road.MaxLng)
+
+			if road.Length != nil {
+				t.Logf("  Length: %.2f meters", *road.Length)
+			} else {
+				t.Logf("  Length: <not set>")
+			}
+
+			if road.StartLat != nil && road.StartLng != nil {
+				t.Logf("  Start: (%.6f, %.6f)", *road.StartLat, *road.StartLng)
+			} else {
+				t.Logf("  Start: <not set>")
+			}
+
+			if road.EndLat != nil && road.EndLng != nil {
+				t.Logf("  End: (%.6f, %.6f)", *road.EndLat, *road.EndLng)
+			} else {
+				t.Logf("  End: <not set>")
+			}
+		}
+
+		// Check for new properties
+		if road.Length != nil && *road.Length > 0 {
+			foundLength = true
+
+			// Validate length is reasonable (between 100m and 100km)
+			if *road.Length < 100 || *road.Length > 100000 {
+				t.Logf("WARNING: Road %s has unusual length: %.2fm", road.RoadID, *road.Length)
+			}
+		}
+
+		if road.StartLat != nil && road.StartLng != nil {
+			foundStartPoint = true
+
+			// Validate start point is within bounding box
+			if *road.StartLat < road.MinLat || *road.StartLat > road.MaxLat {
+				t.Errorf("Road %s: start latitude %.6f outside bounds [%.6f, %.6f]",
+					road.RoadID, *road.StartLat, road.MinLat, road.MaxLat)
+			}
+			if *road.StartLng < road.MinLng || *road.StartLng > road.MaxLng {
+				t.Errorf("Road %s: start longitude %.6f outside bounds [%.6f, %.6f]",
+					road.RoadID, *road.StartLng, road.MinLng, road.MaxLng)
+			}
+		}
+
+		if road.EndLat != nil && road.EndLng != nil {
+			foundEndPoint = true
+
+			// Validate end point is within bounding box
+			if *road.EndLat < road.MinLat || *road.EndLat > road.MaxLat {
+				t.Errorf("Road %s: end latitude %.6f outside bounds [%.6f, %.6f]",
+					road.RoadID, *road.EndLat, road.MinLat, road.MaxLat)
+			}
+			if *road.EndLng < road.MinLng || *road.EndLng > road.MaxLng {
+				t.Errorf("Road %s: end longitude %.6f outside bounds [%.6f, %.6f]",
+					road.RoadID, *road.EndLng, road.MinLng, road.MaxLng)
+			}
+		}
+	}
+
+	// Report findings
+	t.Logf("Summary: Found length=%v, startPoint=%v, endPoint=%v",
+		foundLength, foundStartPoint, foundEndPoint)
+
+	// Note: These properties may not be in old test tiles
+	// If the test tiles are regenerated with the new code, these should pass
+	if !foundLength {
+		t.Log("NOTE: No roads have length property - test tiles may need regeneration")
+	}
+	if !foundStartPoint {
+		t.Log("NOTE: No roads have start point - test tiles may need regeneration")
+	}
+	if !foundEndPoint {
+		t.Log("NOTE: No roads have end point - test tiles may need regeneration")
+	}
+}

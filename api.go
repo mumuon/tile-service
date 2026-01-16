@@ -26,10 +26,11 @@ type APIServer struct {
 
 // JobStatus tracks the current status of a job
 type JobStatus struct {
-	Job       *TileJob
-	Progress  *JobProgress
-	Error     error
-	UpdatedAt time.Time
+	Job        *TileJob
+	Progress   *JobProgress
+	Error      error
+	UpdatedAt  time.Time
+	CancelFunc context.CancelFunc // Function to cancel the job
 }
 
 // JobStatusUpdate represents a status update for streaming
@@ -100,6 +101,8 @@ func (s *APIServer) Start(port int) error {
 	http.HandleFunc("/api/jobs/", s.handleJobStatus)
 	http.HandleFunc("/api/jobs", s.handleListJobs)
 	http.HandleFunc("/api/stream/", s.handleJobStream)
+	http.HandleFunc("/api/cancel/", s.handleCancelJob)
+	http.HandleFunc("/api/regions", s.handleGetRegions)
 	http.HandleFunc("/health", s.handleHealth)
 
 	addr := fmt.Sprintf(":%d", port)
@@ -382,6 +385,102 @@ func (s *APIServer) handleJobStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleGetRegions handles GET /api/regions
+func (s *APIServer) handleGetRegions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Hardcoded list of available regions from curvature-data
+	regions := []string{
+		"test-region", // For testing with sample tiles
+		"alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+		"connecticut", "delaware", "district of columbia", "florida", "georgia",
+		"hawaii", "idaho", "illinois", "indiana", "iowa", "kansas", "kentucky",
+		"louisiana", "maine", "maryland", "massachusetts", "michigan", "minnesota",
+		"mississippi", "missouri", "montana", "nebraska", "nevada", "new hampshire",
+		"new jersey", "new mexico", "new york", "north carolina", "north dakota",
+		"ohio", "oklahoma", "oregon", "pennsylvania", "rhode island", "south carolina",
+		"south dakota", "tennessee", "texas", "utah", "vermont", "virginia",
+		"washington", "west virginia", "wisconsin", "wyoming",
+		"alberta", "british columbia", "manitoba", "new brunswick", "newfoundland and labrador",
+		"northwest territories", "nova scotia", "nunavut", "ontario", "prince edward island",
+		"quebec", "saskatchewan", "yukon",
+		"andorra", "austria", "azerbaijan", "belgium", "bosnia herzegovina", "bulgaria",
+		"croatia", "czech", "denmark", "estonia", "finland", "france", "germany",
+		"greece", "hungary", "iceland", "ireland", "isle of man", "italy", "latvia",
+		"liechtenstein", "lithuania", "luxembourg", "macedonia", "moldova", "monaco",
+		"montenegro", "netherlands", "norway", "poland", "portugal", "romania",
+		"serbia", "slovakia", "slovenia", "spain", "sweden", "switzerland",
+		"turkey", "ukraine", "united kingdom",
+		"argentina", "bolivia", "brazil", "chile", "colombia", "ecuador",
+		"guyana", "paraguay", "peru", "suriname", "uruguay", "venezuela",
+		"japan",
+		"mexico",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(regions)
+}
+
+// handleCancelJob handles POST /api/cancel/{jobId}
+func (s *APIServer) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract job ID from path
+	jobID := r.URL.Path[len("/api/cancel/"):]
+	if jobID == "" {
+		http.Error(w, "Job ID is required", http.StatusBadRequest)
+		return
+	}
+
+	// Get job status
+	s.jobsMutex.Lock()
+	status, exists := s.activeJobs[jobID]
+	if !exists {
+		s.jobsMutex.Unlock()
+		http.Error(w, "Job not found or already completed", http.StatusNotFound)
+		return
+	}
+
+	// Call cancel function if it exists
+	if status.CancelFunc != nil {
+		status.CancelFunc()
+		slog.Info("job cancelled", "job_id", jobID, "region", status.Job.Region)
+	}
+	s.jobsMutex.Unlock()
+
+	// Update job status in database
+	if s.db != nil {
+		ctx := context.Background()
+		errMsg := "Job was cancelled by user"
+		query := `
+			UPDATE "TileJob"
+			SET status = 'failed',
+			    "errorMessage" = $1,
+			    "updatedAt" = $2
+			WHERE id = $3
+		`
+		_, err := s.db.conn.ExecContext(ctx, query, errMsg, time.Now(), jobID)
+		if err != nil {
+			slog.Error("failed to update cancelled job in database", "error", err, "job_id", jobID)
+		}
+	}
+
+	// Send cancellation update to subscribers
+	s.updateJobStatus(jobID, "failed", "Job was cancelled by user")
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Job cancelled successfully",
+		"jobId":   jobID,
+	})
+}
+
 // handleHealth handles GET /health
 func (s *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -400,7 +499,17 @@ func (s *APIServer) processJobs() {
 
 // processJob processes a single job
 func (s *APIServer) processJob(job *TileJob) {
-	ctx := context.Background()
+	// Create cancellable context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Ensure cleanup
+
+	// Store cancel function in job status
+	s.jobsMutex.Lock()
+	if status, exists := s.activeJobs[job.ID]; exists {
+		status.CancelFunc = cancel
+	}
+	s.jobsMutex.Unlock()
+
 	slog.Info("processing job", "job_id", job.ID, "region", job.Region)
 
 	// Update status to processing

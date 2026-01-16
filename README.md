@@ -1,9 +1,26 @@
 # Tile Service
 
-A high-performance, production-ready Go service for generating vector tiles from road geometry data and uploading them to Cloudflare R2 storage.
+A high-performance, production-ready Go service for generating vector tiles from road geometry data and serving them over HTTP.
+
+## Quick Start (Docker - Recommended)
+
+```bash
+# Start as a background service
+./docker-start.sh
+
+# Check status
+./docker-status.sh
+
+# Generate tiles
+./docker-generate.sh oregon
+```
+
+See [DOCKER.md](DOCKER.md) for detailed Docker setup and [RUNNING_AS_SERVICE.md](RUNNING_AS_SERVICE.md) for running as a persistent service.
 
 ## Features
 
+- **HTTP Server Mode**: Serves tiles and provides REST API for tile generation
+- **Docker Support**: Run as a containerized service with auto-restart
 - **Direct CLI mode**: Call tile service as a command-line tool with region name and optional zoom level parameters
 - **Configurable zoom levels**: Set custom min/max zoom levels per region (default 5-16)
 - **Skip upload option**: Generate and save tiles locally without uploading to R2
@@ -14,6 +31,7 @@ A high-performance, production-ready Go service for generating vector tiles from
 - **AWS SDK v2**: Efficient Cloudflare R2 uploads via AWS SDK (replaces rclone)
 - **Optional database tracking**: Logs tile generation progress to PostgreSQL (falls back gracefully if unavailable)
 - **Cross-platform builds**: Easy compilation for Linux, macOS, and Windows
+- **Health checks**: Built-in health endpoint for monitoring
 
 ## Architecture
 
@@ -35,12 +53,21 @@ A high-performance, production-ready Go service for generating vector tiles from
 
 ### Key Components
 
-1. **CLI Entry**: Direct region-based command-line invocation with customizable parameters
-2. **KMZ Extractor**: Go native zip handling for KMZ file extraction
-3. **KML to GeoJSON Converter**: Native Go XML parsing (no external Python dependencies)
-4. **Tippecanoe Wrapper**: Subprocess calls with configurable zoom levels
-5. **R2 Uploader**: AWS SDK v2 with Cloudflare R2 custom endpoint resolution
-6. **Optional Database Layer**: PostgreSQL progress tracking (gracefully optional)
+1. **HTTP Server**: Serves tiles and provides REST API (`serve` command)
+2. **CLI Entry**: Direct region-based command-line invocation with customizable parameters
+3. **KMZ Extractor**: Go native zip handling for KMZ file extraction
+4. **KML to GeoJSON Converter**: Native Go XML parsing (no external Python dependencies)
+5. **Tippecanoe Wrapper**: Subprocess calls with configurable zoom levels
+6. **R2 Uploader**: AWS SDK v2 with Cloudflare R2 custom endpoint resolution
+7. **Optional Database Layer**: PostgreSQL progress tracking (gracefully optional)
+
+## Documentation
+
+- **[DOCKER.md](DOCKER.md)** - Docker setup and usage (recommended)
+- **[RUNNING_AS_SERVICE.md](RUNNING_AS_SERVICE.md)** - Running as a persistent background service
+- **[ROAD_GEOMETRY_EXTRACTION.md](ROAD_GEOMETRY_EXTRACTION.md)** - Road geometry extraction details
+- **[TESTING.md](TESTING.md)** - Testing and validation
+- **[WORKFLOW_GUIDE.md](WORKFLOW_GUIDE.md)** - Development workflow
 
 ## Requirements
 

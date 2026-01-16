@@ -50,8 +50,15 @@ type ServiceConfig struct {
 
 // LoadConfig loads configuration from environment variables and .env file
 func LoadConfig(envPath string) (*Config, error) {
-	// Load .env file if it exists
-	if _, err := os.Stat(envPath); err == nil {
+	// Prefer .env.local over .env (like Next.js)
+	// This allows local development configuration to override production config
+	localEnvPath := strings.TrimSuffix(envPath, ".env") + ".env.local"
+	if _, err := os.Stat(localEnvPath); err == nil {
+		if err := loadEnvFile(localEnvPath); err != nil {
+			return nil, fmt.Errorf("failed to load local env file: %w", err)
+		}
+	} else if _, err := os.Stat(envPath); err == nil {
+		// Fall back to regular .env file if .env.local doesn't exist
 		if err := loadEnvFile(envPath); err != nil {
 			return nil, fmt.Errorf("failed to load env file: %w", err)
 		}
@@ -89,9 +96,8 @@ func LoadConfig(envPath string) (*Config, error) {
 	if cfg.Database.Password == "" {
 		return nil, fmt.Errorf("DB_PASSWORD environment variable is required")
 	}
-	if cfg.S3.AccessKeyID == "" || cfg.S3.SecretAccessKey == "" {
-		return nil, fmt.Errorf("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY environment variables are required")
-	}
+	// Note: S3 credentials are optional - only needed if you plan to upload tiles to R2
+	// For local development with --skip-upload, S3 credentials are not required
 
 	return cfg, nil
 }

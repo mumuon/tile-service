@@ -1,27 +1,48 @@
-version: '3.8'
-
 services:
   tile-service:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: drivefinder-tile-service
-    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount centralized data directories
+      - ~/data/df/tiles:/app/tiles
+      - ~/data/df/curvature-data:/app/curvature-data
     environment:
+      # Database configuration - loaded from .env file
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      - DB_SSLMODE=${DB_SSLMODE}
+      # S3/R2 configuration (only needed if uploading)
+      - S3_ENDPOINT=${S3_ENDPOINT:-}
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-}
+      - S3_REGION=${S3_REGION:-us-west-1}
+      - S3_BUCKET=${S3_BUCKET:-drivefinder-tiles}
+      - S3_BUCKET_PATH=${S3_BUCKET_PATH:-tiles}
+      # Service configuration
+      - OUTPUT_DIR=/app/tiles
+      - CURVATURE_DATA_DIR=/app/curvature-data
       - WORKERS=4
       - POLL_INTERVAL_SECONDS=10
-    volumes:
-      # Mount curvature data directory
-      - ./curvature-data:/app/curvature-data:ro
-      # Mount output tiles directory
-      - ./public/tiles:/app/public/tiles:rw
+    networks:
+      - drivefinder
+    # Optional: depends on postgres only when using local mode
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ['CMD', 'ps', 'aux']
+      test: ['CMD', 'wget', '--quiet', '--tries=1', '--spider', 'http://localhost:8080/health']
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 10s
     logging:
       driver: 'json-file'
       options:
@@ -36,3 +57,30 @@ services:
     #     reservations:
     #       cpus: '1'
     #       memory: 1G
+
+  postgres:
+    image: postgres:15
+    container_name: drivefinder-postgres
+    environment:
+      - POSTGRES_PASSWORD=localdev
+      - POSTGRES_DB=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      # Persist database data
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - drivefinder
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  drivefinder:
+    driver: bridge
+
+volumes:
+  postgres-data:

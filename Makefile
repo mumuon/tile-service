@@ -1,19 +1,35 @@
 .PHONY: build build-linux build-macos build-windows clean run help
+.PHONY: test test-unit test-unit-coverage test-converter test-extractor test-api test-integration test-docker test-watch test-all
 
 # Default target
 help:
-	@echo "Tile Service Build Targets"
-	@echo "=========================="
+	@echo "Tile Service Build & Test Targets"
+	@echo "=================================="
 	@echo ""
-	@echo "make build          - Build for current platform (default: macOS arm64)"
-	@echo "make build-linux    - Build for Linux (amd64)"
-	@echo "make build-windows  - Build for Windows (amd64)"
-	@echo "make build-macos    - Build for macOS (arm64)"
-	@echo "make build-all      - Build for all platforms"
-	@echo "make clean          - Remove built binaries"
-	@echo "make run            - Build and run locally (requires .env)"
-	@echo "make docker-build   - Build Docker image"
-	@echo "make docker-run     - Run service in Docker container"
+	@echo "Build Targets:"
+	@echo "  make build          - Build for current platform (default: macOS arm64)"
+	@echo "  make build-linux    - Build for Linux (amd64)"
+	@echo "  make build-windows  - Build for Windows (amd64)"
+	@echo "  make build-macos    - Build for macOS (arm64)"
+	@echo "  make build-all      - Build for all platforms"
+	@echo "  make clean          - Remove built binaries"
+	@echo "  make run            - Build and run locally (requires .env)"
+	@echo ""
+	@echo "Test Targets:"
+	@echo "  make test           - Run all unit tests"
+	@echo "  make test-unit      - Run unit tests with verbose output"
+	@echo "  make test-coverage  - Run tests with coverage report"
+	@echo "  make test-converter - Test KML to GeoJSON converter"
+	@echo "  make test-extractor - Test geometry extractor"
+	@echo "  make test-api       - Test API server endpoints"
+	@echo "  make test-integration - Full pipeline integration test"
+	@echo "  make test-docker    - Quick Docker test"
+	@echo "  make test-watch     - Watch mode for continuous testing"
+	@echo "  make test-all       - Run all tests (unit + components + integration)"
+	@echo ""
+	@echo "Docker Targets:"
+	@echo "  make docker-build   - Build Docker image"
+	@echo "  make docker-run     - Run service in Docker container"
 	@echo ""
 
 # Build variables
@@ -76,3 +92,54 @@ docker-run: docker-build
 test-build:
 	go build -o /dev/null .
 	@echo "✓ Compilation successful"
+
+# Test targets
+test:
+	@echo "Running unit tests..."
+	go test ./...
+
+test-unit:
+	@echo "Running unit tests (verbose)..."
+	./scripts/test/test-unit.sh -v
+
+test-coverage:
+	@echo "Running tests with coverage..."
+	./scripts/test/test-unit.sh -v -c
+
+test-coverage-html:
+	@echo "Running tests with coverage (HTML report)..."
+	./scripts/test/test-unit.sh -h
+
+test-converter:
+	@echo "Testing converter component..."
+	./scripts/test/test-converter.sh
+
+test-extractor:
+	@echo "Testing geometry extractor..."
+	./scripts/test/test-extractor.sh
+
+test-api:
+	@echo "Testing API server..."
+	./scripts/test/test-api.sh
+
+test-integration:
+	@echo "Running integration test..."
+	./scripts/test/test-integration.sh
+
+test-integration-cleanup:
+	@echo "Running integration test with cleanup..."
+	./scripts/test/test-integration.sh test-region --cleanup
+
+test-docker:
+	@echo "Running Docker test..."
+	./scripts/test/test-docker.sh
+
+test-watch:
+	@echo "Starting watch mode..."
+	./scripts/test/watch-tests.sh
+
+test-all: test-unit test-converter test-extractor test-integration
+	@echo ""
+	@echo "========================================="
+	@echo "  All Tests Complete ✓"
+	@echo "========================================="
