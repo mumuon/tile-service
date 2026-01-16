@@ -1,0 +1,21 @@
+# Ignore tiles directory (can be large)
+tiles/
+*.mbtiles
+
+# Ignore local environment files
+.env.local
+.env
+
+# Ignore build artifacts
+tile-service
+
+# Ignore git
+.git
+.gitignore
+
+# Ignore extracted roads files
+.extracted-roads-*.json
+
+# Ignore temporary files
+*.tmp
+*.log
