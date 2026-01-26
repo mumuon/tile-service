@@ -39,6 +39,30 @@ func (s *TileService) UploadToR2(ctx context.Context, tilesDir, region string) (
 	return totalBytes, nil
 }
 
+// UploadMergedTilesForRegion uploads only tiles from mergedDir that match the region's tile coordinates
+// This is efficient: we get merged content (multi-region roads) but only upload the target region's tiles
+func (s *TileService) UploadMergedTilesForRegion(ctx context.Context, mergedDir, regionDir, region string) (int64, error) {
+	logger := slog.With("region", region, "merged_dir", mergedDir, "region_dir", regionDir)
+	logger.Info("starting R2 upload of merged tiles for region only")
+
+	// Get the tile coordinates from the region directory
+	regionCoords, err := GetTileCoords(regionDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get region tile coords: %w", err)
+	}
+
+	logger.Info("uploading merged tiles for region coordinates", "tile_count", len(regionCoords))
+
+	// Upload only the tiles that match the region's coordinates
+	totalBytes, err := s.s3.UploadTilesWithFilter(ctx, mergedDir, s.config.S3.BucketPath, regionCoords)
+	if err != nil {
+		return 0, fmt.Errorf("failed to upload to R2: %w", err)
+	}
+
+	logger.Info("R2 upload completed", "total_bytes", totalBytes, "tiles_uploaded", len(regionCoords))
+	return totalBytes, nil
+}
+
 // UploadToR2WithZoomFilter uploads generated tiles to R2 with optional zoom level filtering
 // Filters locally by only walking through the specified zoom level directories
 func (s *TileService) UploadToR2WithZoomFilter(ctx context.Context, tilesDir, region string, minZoom, maxZoom int) (int64, error) {
@@ -112,6 +136,20 @@ func (s *TileService) ProcessJobWithOptions(ctx context.Context, job *TileJob, o
 	var totalSize int64
 	var roadsCount int
 	var kmlPath, geoJSONPath string
+
+	// Ensure cleanup of temporary files on ANY exit (success or failure)
+	// This prevents temp directory accumulation when processing fails mid-way
+	defer func() {
+		if opts.NoCleanup {
+			logger.Info("skipping cleanup (--no-cleanup flag set)", "kml_path", kmlPath, "geojson_path", geoJSONPath)
+			return
+		}
+		if kmlPath != "" || geoJSONPath != "" {
+			if err := CleanupTemporaryFiles(ctx, kmlPath, geoJSONPath, ""); err != nil {
+				logger.Warn("failed to cleanup temporary files", "error", err)
+			}
+		}
+	}()
 
 	// If skipGeneration is true, skip tile generation and use existing tiles
 	if opts.SkipGeneration {
@@ -194,9 +232,12 @@ func (s *TileService) ProcessJobWithOptions(ctx context.Context, job *TileJob, o
 			}
 		}
 
-		// Note: Currently GenerateTiles uses hardcoded 5-16 zoom levels
-		// TODO: Make Tippecanoe zoom levels configurable via opts.MinZoom/opts.MaxZoom
-		tilesDir, tilesCount, totalSize, err = GenerateTiles(ctx, geoJSONPath, job.Region, s.config.Paths.OutputDir)
+		// Generate tiles with configurable zoom levels
+		genOpts := &GenerateTilesOptions{
+			MinZoom: opts.MinZoom,
+			MaxZoom: opts.MaxZoom,
+		}
+		tilesDir, tilesCount, totalSize, err = GenerateTilesWithOptions(ctx, geoJSONPath, job.Region, s.config.Paths.OutputDir, genOpts)
 		if err != nil {
 			if s.db != nil {
 				s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("tile generation failed: %v", err))
@@ -212,7 +253,53 @@ func (s *TileService) ProcessJobWithOptions(ctx context.Context, job *TileJob, o
 		}
 	}
 
-	// Phase 4 & 5: Run geometry extraction and R2 upload in parallel
+	// Phase 4: Merge regional tiles
+	// Skip merge if SkipMerge is set (useful for batch processing multiple regions)
+	// By default, only merge with overlapping neighbors for efficiency
+	// Use MergeAll option to merge all regions
+	var mergedDir string
+	if opts.SkipMerge {
+		logger.Info("skipping merge (--skip-merge flag set)")
+	} else {
+		logger.Info("merging regional tiles", "merge_all", opts.MergeAll)
+		if s.db != nil {
+			if err := s.db.UpdateJobStatus(ctx, job.ID, "merging"); err != nil {
+				logger.Warn("failed to update job status", "error", err)
+			}
+		}
+
+		var regionDirs []string
+		var err error
+
+		if opts.MergeAll {
+			// Merge all regions
+			regionDirs, err = FindRegionalTileDirs(s.config.Paths.OutputDir)
+			if err != nil {
+				return fmt.Errorf("failed to find regional tile directories: %w", err)
+			}
+			logger.Info("merging all regions", "count", len(regionDirs))
+		} else {
+			// Only merge with overlapping neighbors (more efficient)
+			regionDirs, err = FindOverlappingRegions(s.config.Paths.OutputDir, job.Region)
+			if err != nil {
+				return fmt.Errorf("failed to find overlapping regions: %w", err)
+			}
+			logger.Info("merging overlapping regions only", "count", len(regionDirs), "dirs", regionDirs)
+		}
+
+		if len(regionDirs) == 0 {
+			return fmt.Errorf("no regional tile directories found in %s", s.config.Paths.OutputDir)
+		}
+
+		mergedDir = filepath.Join(s.config.Paths.OutputDir, "merged")
+		mergeMetadata, err := MergeTiles(ctx, regionDirs, mergedDir)
+		if err != nil {
+			return fmt.Errorf("failed to merge tiles: %w", err)
+		}
+		logger.Info("tiles merged", "regions", len(regionDirs), "tiles_count", mergeMetadata.TilesCount, "size_bytes", mergeMetadata.TotalSize)
+	}
+
+	// Phase 5 & 6: Run geometry extraction and R2 upload in parallel
 	// This significantly speeds up processing by utilizing concurrent I/O operations
 	logger.Info("starting parallel operations: geometry extraction and R2 upload")
 
@@ -242,7 +329,7 @@ func (s *TileService) ProcessJobWithOptions(ctx context.Context, job *TileJob, o
 	uploadChan := make(chan uploadResult, 1)
 	geometryChan := make(chan geometryResult, 1)
 
-	// Goroutine 1: Extract and insert road geometries
+	// Goroutine 1: Extract and insert road geometries (from regional tiles, not merged)
 	if opts.ExtractGeometry {
 		go func() {
 			logger.Info("starting road geometry extraction (parallel)")
@@ -288,11 +375,12 @@ func (s *TileService) ProcessJobWithOptions(ctx context.Context, job *TileJob, o
 		geometryChan <- geometryResult{0, nil}
 	}
 
-	// Goroutine 2: Upload to R2
+	// Goroutine 2: Upload MERGED tiles to R2, but only for the region's tile coordinates
+	// This gives us merged content (multi-region roads) but we only pay for the region's tile count
 	if !opts.SkipUpload {
 		go func() {
-			logger.Info("starting R2 upload (parallel)")
-			uploadedBytes, err := s.UploadToR2(ctx, tilesDir, job.Region)
+			logger.Info("starting R2 upload of merged tiles for region coordinates", "merged_dir", mergedDir, "region", job.Region)
+			uploadedBytes, err := s.UploadMergedTilesForRegion(ctx, mergedDir, tilesDir, job.Region)
 			if err != nil {
 				logger.Error("R2 upload failed", "error", err)
 				uploadChan <- uploadResult{0, err}
@@ -327,21 +415,14 @@ func (s *TileService) ProcessJobWithOptions(ctx context.Context, job *TileJob, o
 		"uploaded_bytes", uploadRes.bytes,
 		"geometry_count", geometryRes.count)
 
-	// Phase 6: Mark as complete
+	// Phase 7: Mark as complete
 	if s.db != nil {
 		if err := s.db.CompleteJob(ctx, job.ID, roadsCount, tilesCount, totalSize); err != nil {
 			logger.Warn("failed to mark job complete", "error", err)
 		}
 	}
 
-	// Cleanup temporary files (unless disabled)
-	if !opts.NoCleanup {
-		if err := CleanupTemporaryFiles(ctx, kmlPath, geoJSONPath, tilesDir); err != nil {
-			logger.Warn("failed to cleanup temporary files", "error", err)
-		}
-	} else {
-		logger.Info("skipping cleanup, temporary files preserved", "kml_path", kmlPath, "geojson_path", geoJSONPath)
-	}
+	// Note: Cleanup is handled by defer at the top of this function
 
 	logger.Info("job processing complete")
 	return nil

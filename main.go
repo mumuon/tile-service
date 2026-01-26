@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -47,6 +48,8 @@ func main() {
 		cmdExtract(args[1:], configPath, debug)
 	} else if command == "insert-geometries" {
 		cmdInsertGeometries(args[1:], configPath, debug)
+	} else if command == "merge" {
+		cmdMerge(args[1:], configPath, debug)
 	} else if command == "serve" {
 		cmdServe(args[1:], configPath, debug)
 	} else {
@@ -56,23 +59,25 @@ func main() {
 	}
 }
 
-// cmdGenerate handles tile generation
+// cmdGenerate handles tile generation for one or more regions
 func cmdGenerate(args []string, configPath *string, debug *bool) {
 	fs := flag.NewFlagSet("generate", flag.ExitOnError)
 	maxZoom := fs.Int("max-zoom", 16, "Maximum zoom level for tiles")
 	minZoom := fs.Int("min-zoom", 5, "Minimum zoom level for tiles")
 	skipUpload := fs.Bool("skip-upload", false, "Skip R2 upload")
+	skipMerge := fs.Bool("skip-merge", false, "Skip merging with other regions (for batch processing)")
 	noCleanup := fs.Bool("no-cleanup", false, "Don't cleanup temporary files")
 	extractGeometry := fs.Bool("extract-geometry", true, "Extract road geometries into database")
 	skipGeometryInsertion := fs.Bool("skip-geometry-insertion", false, "Extract geometries to file but don't insert to database")
+	mergeAll := fs.Bool("merge-all", false, "Merge all regions instead of just overlapping neighbors")
+	workers := fs.Int("workers", 1, "Number of parallel workers for multi-region generation")
 	fs.Parse(args)
 
-	parsedArgs := fs.Args()
-	if len(parsedArgs) == 0 {
-		slog.Error("region required")
+	regions := fs.Args()
+	if len(regions) == 0 {
+		slog.Error("at least one region required")
 		os.Exit(1)
 	}
-	region := parsedArgs[0]
 
 	// Load configuration
 	cfg, err := LoadConfig(*configPath)
@@ -80,8 +85,6 @@ func cmdGenerate(args []string, configPath *string, debug *bool) {
 		slog.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
-
-	slog.Info("starting tile generation", "region", region, "max_zoom", *maxZoom, "min_zoom", *minZoom, "skip_upload", *skipUpload)
 
 	// Initialize database connection (optional)
 	db, err := NewDatabase(cfg.Database)
@@ -109,32 +112,131 @@ func cmdGenerate(args []string, configPath *string, debug *bool) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Run the pipeline
-	done := make(chan error, 1)
-	go func() {
-		job := &TileJob{
-			ID:     "1",
-			Region: region,
-			Status: "pending",
-		}
-		done <- service.ProcessJobWithOptions(ctx, job, &JobOptions{
-			MaxZoom:              *maxZoom,
-			MinZoom:              *minZoom,
-			SkipUpload:           *skipUpload,
-			NoCleanup:            *noCleanup,
-			ExtractGeometry:      *extractGeometry,
-			SkipGeometryInsertion: *skipGeometryInsertion,
-		})
-	}()
+	// Build job options (shared across all regions)
+	opts := &JobOptions{
+		MaxZoom:               *maxZoom,
+		MinZoom:               *minZoom,
+		SkipUpload:            *skipUpload,
+		SkipMerge:             *skipMerge,
+		NoCleanup:             *noCleanup,
+		ExtractGeometry:       *extractGeometry,
+		SkipGeometryInsertion: *skipGeometryInsertion,
+		MergeAll:              *mergeAll,
+	}
 
-	// Wait for completion or signal
-	select {
-	case err := <-done:
-		if err != nil {
-			slog.Error("tile generation failed", "error", err)
+	// Single region - simple path
+	if len(regions) == 1 {
+		region := regions[0]
+		slog.Info("starting tile generation", "region", region, "max_zoom", *maxZoom, "min_zoom", *minZoom, "skip_upload", *skipUpload)
+
+		done := make(chan error, 1)
+		go func() {
+			job := &TileJob{
+				ID:     "1",
+				Region: region,
+				Status: "pending",
+			}
+			done <- service.ProcessJobWithOptions(ctx, job, opts)
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				slog.Error("tile generation failed", "error", err)
+				os.Exit(1)
+			}
+			slog.Info("tile generation completed successfully")
+		case sig := <-sigChan:
+			slog.Info("received shutdown signal", "signal", sig)
+			cancel()
+			<-done
 			os.Exit(1)
 		}
-		slog.Info("tile generation completed successfully")
+		return
+	}
+
+	// Multiple regions - parallel processing with worker pool
+	numWorkers := *workers
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	if numWorkers > len(regions) {
+		numWorkers = len(regions)
+	}
+
+	slog.Info("starting batch tile generation",
+		"regions", len(regions),
+		"workers", numWorkers,
+		"skip_upload", *skipUpload,
+		"skip_merge", *skipMerge,
+	)
+
+	// Create work channel and results tracking
+	workChan := make(chan string, len(regions))
+	for _, region := range regions {
+		workChan <- region
+	}
+	close(workChan)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var failed []string
+	var succeeded []string
+
+	// Start workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for region := range workChan {
+				// Check if context cancelled
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				logger := slog.With("worker", workerID, "region", region)
+				logger.Info("starting region")
+
+				job := &TileJob{
+					ID:     fmt.Sprintf("batch-%d-%s", workerID, region),
+					Region: region,
+					Status: "pending",
+				}
+
+				err := service.ProcessJobWithOptions(ctx, job, opts)
+
+				mu.Lock()
+				if err != nil {
+					logger.Error("region failed", "error", err)
+					failed = append(failed, region)
+				} else {
+					logger.Info("region completed")
+					succeeded = append(succeeded, region)
+				}
+				mu.Unlock()
+			}
+		}(i)
+	}
+
+	// Wait for completion or signal
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		slog.Info("batch generation completed",
+			"succeeded", len(succeeded),
+			"failed", len(failed),
+		)
+		if len(failed) > 0 {
+			slog.Error("failed regions", "regions", failed)
+			os.Exit(1)
+		}
 	case sig := <-sigChan:
 		slog.Info("received shutdown signal", "signal", sig)
 		cancel()
@@ -386,6 +488,131 @@ func cmdInsertGeometries(args []string, configPath *string, debug *bool) {
 	}
 }
 
+// cmdMerge handles merging regional tiles into a single merged output
+func cmdMerge(args []string, configPath *string, debug *bool) {
+	fs := flag.NewFlagSet("merge", flag.ExitOnError)
+	skipUpload := fs.Bool("skip-upload", false, "Skip R2 upload after merging")
+	forRegion := fs.String("for", "", "Only merge regions that overlap with specified region (e.g., --for washington)")
+	minZoom := fs.Int("min-zoom", -1, "Minimum zoom level to merge (-1 = all)")
+	maxZoom := fs.Int("max-zoom", -1, "Maximum zoom level to merge (-1 = all)")
+	fs.Parse(args)
+
+	// Load configuration
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		slog.Error("failed to load config", "error", err)
+		os.Exit(1)
+	}
+
+	// Get list of regions to merge
+	parsedArgs := fs.Args()
+	var inputDirs []string
+
+	if *forRegion != "" {
+		// Find only overlapping regions for efficiency
+		inputDirs, err = FindOverlappingRegions(cfg.Paths.OutputDir, *forRegion)
+		if err != nil {
+			slog.Error("failed to find overlapping regions", "error", err, "for_region", *forRegion)
+			os.Exit(1)
+		}
+		if len(inputDirs) == 0 {
+			slog.Error("no overlapping regions found", "for_region", *forRegion)
+			os.Exit(1)
+		}
+		slog.Info("merging overlapping regions", "for_region", *forRegion, "count", len(inputDirs), "dirs", inputDirs)
+	} else if len(parsedArgs) > 0 {
+		// Merge specific regions
+		for _, region := range parsedArgs {
+			regionDir := filepath.Join(cfg.Paths.OutputDir, region)
+			if _, err := os.Stat(regionDir); os.IsNotExist(err) {
+				slog.Error("region tiles not found", "region", region, "dir", regionDir)
+				os.Exit(1)
+			}
+			inputDirs = append(inputDirs, regionDir)
+		}
+		slog.Info("merging specified regions", "regions", parsedArgs)
+	} else {
+		// Find all regional tile directories
+		inputDirs, err = FindRegionalTileDirs(cfg.Paths.OutputDir)
+		if err != nil {
+			slog.Error("failed to find regional tile directories", "error", err)
+			os.Exit(1)
+		}
+		if len(inputDirs) == 0 {
+			slog.Error("no regional tile directories found", "base_dir", cfg.Paths.OutputDir)
+			os.Exit(1)
+		}
+		slog.Info("merging all regions", "count", len(inputDirs), "dirs", inputDirs)
+	}
+
+	// Setup signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Run merge
+	done := make(chan error, 1)
+	go func() {
+		mergedDir := filepath.Join(cfg.Paths.OutputDir, "merged")
+
+		// Setup merge options with zoom filtering
+		var mergeOpts *MergeTilesOptions
+		if *minZoom >= 0 || *maxZoom >= 0 {
+			mergeOpts = &MergeTilesOptions{
+				MinZoom: *minZoom,
+				MaxZoom: *maxZoom,
+			}
+		}
+
+		metadata, err := MergeTilesWithOptions(ctx, inputDirs, mergedDir, mergeOpts)
+		if err != nil {
+			done <- err
+			return
+		}
+
+		slog.Info("merge completed", "tiles_count", metadata.TilesCount, "size_bytes", metadata.TotalSize, "output_dir", mergedDir)
+
+		if !*skipUpload {
+			// Initialize S3 client and upload
+			s3Client, err := NewS3Client(cfg.S3)
+			if err != nil {
+				done <- fmt.Errorf("failed to initialize S3 client: %w", err)
+				return
+			}
+
+			service := NewTileService(nil, s3Client, cfg)
+			uploadedBytes, err := service.UploadToR2(ctx, mergedDir, "merged")
+			if err != nil {
+				done <- fmt.Errorf("failed to upload merged tiles: %w", err)
+				return
+			}
+
+			slog.Info("upload completed", "uploaded_bytes", uploadedBytes)
+		} else {
+			slog.Info("skipping R2 upload, merged tiles saved locally", "output_dir", mergedDir)
+		}
+
+		done <- nil
+	}()
+
+	// Wait for completion or signal
+	select {
+	case err := <-done:
+		if err != nil {
+			slog.Error("merge failed", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("merge operation completed successfully")
+	case sig := <-sigChan:
+		slog.Info("received shutdown signal", "signal", sig)
+		cancel()
+		<-done
+		os.Exit(1)
+	}
+}
+
 // cmdServe starts the REST API server
 func cmdServe(args []string, configPath *string, debug *bool) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
@@ -459,21 +686,25 @@ Commands:
   upload                Upload pre-generated tiles to R2
   extract               Extract road geometries from existing tiles into database
   insert-geometries     Insert extracted road geometries from file into database
+  merge                 Merge regional tiles and upload to R2
   serve                 Start the REST API server
 
 Generate Command:
-  Usage: tile-service generate [options] <region>
+  Usage: tile-service generate [options] <region> [region2] [region3] ...
 
   Arguments:
-    <region>              Region name (e.g., washington, maryland, japan, oregon)
+    <region>              One or more region names (e.g., washington oregon california)
 
   Options:
     -max-zoom int         Maximum zoom level (default 16)
     -min-zoom int         Minimum zoom level (default 5)
     -skip-upload          Skip R2 upload, keep tiles locally in ./public/tiles
+    -skip-merge           Skip merging with other regions (for batch processing)
     -no-cleanup           Don't cleanup temporary files after completion
     -extract-geometry     Extract road geometries into database (default true)
     -skip-geometry-insertion  Extract to file but don't insert to database
+    -merge-all            Merge all regions instead of just overlapping neighbors
+    -workers int          Number of parallel workers for multi-region generation (default 1)
 
 Upload Command:
   Usage: tile-service upload [options] <tiles_directory>
@@ -509,6 +740,29 @@ Insert Geometries Command:
     Use this after generating tiles with -skip-geometry-insertion flag.
     Allows you to review extracted data before inserting to database.
 
+Merge Command:
+  Usage: tile-service merge [options] [regions...]
+
+  Arguments:
+    [regions...]          Optional list of regions to merge (e.g., washington oregon)
+                          If not specified, merges all regional tile directories
+
+  Options:
+    -skip-upload          Skip R2 upload after merging (keep tiles locally)
+    -for <region>         Only merge regions that have overlapping tiles with <region>
+                          This is more efficient than merging all regions
+
+  Description:
+    Merges multiple regional tile directories into a single "merged" directory
+    using tile-join. This combines tiles from overlapping regions so all roads
+    are visible at low zoom levels. The merged tiles are then uploaded to R2.
+
+    This command is useful for:
+    - Re-merging after adding new regional tiles without regenerating
+    - Fixing R2 after accidental overwrites from individual region uploads
+    - Manual control over which regions to include in the merged output
+    - Using --for to efficiently merge only neighboring regions
+
 Serve Command:
   Usage: tile-service serve [options]
 
@@ -538,6 +792,13 @@ Examples:
   # Generate tiles with minimal zoom levels for debugging
   ./tile-service generate -max-zoom 7 -skip-upload -no-cleanup maryland
 
+  # Batch generate multiple regions with 4 parallel workers (no upload/merge)
+  ./tile-service generate -workers 4 -skip-upload -skip-merge washington oregon california idaho
+
+  # Batch generate all US states, then merge once (efficient workflow)
+  ./tile-service generate -workers 4 -skip-upload -skip-merge alabama alaska arizona ...
+  ./tile-service merge
+
   # Upload pre-generated tiles
   ./tile-service upload public/tiles/oregon
 
@@ -560,6 +821,18 @@ Examples:
 
   # Generate tiles without geometry extraction
   ./tile-service generate -extract-geometry=false washington
+
+  # Merge all regional tiles and upload to R2
+  ./tile-service merge
+
+  # Merge only regions that overlap with washington (faster)
+  ./tile-service merge --for washington
+
+  # Merge specific regions only
+  ./tile-service merge washington oregon california
+
+  # Merge tiles locally without uploading
+  ./tile-service merge --skip-upload
 
   # Start the REST API server
   ./tile-service serve

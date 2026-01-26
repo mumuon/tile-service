@@ -4,10 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -42,8 +46,27 @@ func NewS3Client(cfg S3Config) (*S3Client, error) {
 		return aws.Endpoint{}, &smithy.GenericAPIError{Code: "UnknownEndpoint"}
 	})
 
+	// Create custom HTTP client with connection pooling optimized for parallel uploads
+	// MaxIdleConnsPerHost should match or exceed the number of upload workers (100)
+	// to ensure connections are reused instead of constantly opened/closed
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        150,
+			MaxIdleConnsPerHost: 150, // Must match or exceed worker count for connection reuse
+			IdleConnTimeout:     90 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+		Timeout: 5 * time.Minute, // Overall request timeout
+	}
+
 	// Load AWS config
 	awsCfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithHTTPClient(httpClient),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
 			cfg.AccessKeyID,
 			cfg.SecretAccessKey,
@@ -123,7 +146,7 @@ func (s *S3Client) UploadDirectory(ctx context.Context, localDir, s3Prefix strin
 	logger.Info("found files to upload", "count", len(files))
 
 	// Upload files in parallel using worker pool
-	const numWorkers = 32 // Parallel upload workers
+	const numWorkers = 100 // Parallel upload workers
 	var totalBytes int64
 	var fileCount int
 	var mu sync.Mutex
@@ -206,6 +229,160 @@ func (s *S3Client) UploadDirectory(ctx context.Context, localDir, s3Prefix strin
 	}
 
 	logger.Info("directory upload completed", "total_files", fileCount, "total_bytes", totalBytes)
+	return totalBytes, nil
+}
+
+// UploadTilesWithFilter uploads only tiles from a directory that match the given coordinates
+// This allows uploading merged tiles but only for specific region's tile coordinates
+func (s *S3Client) UploadTilesWithFilter(ctx context.Context, localDir, s3Prefix string, coords map[TileCoord]bool) (int64, error) {
+	logger := slog.With("local_dir", localDir, "s3_prefix", s3Prefix, "filter_count", len(coords))
+	logger.Info("starting filtered upload to R2")
+
+	// Collect files that match the filter
+	type fileToUpload struct {
+		path    string
+		relPath string
+		s3Key   string
+		size    int64
+	}
+
+	var files []fileToUpload
+
+	err := filepath.Walk(localDir, func(filePath string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() || filepath.Ext(filePath) != ".pbf" {
+			return nil
+		}
+
+		// Parse z/x/y.pbf from path
+		relPath, err := filepath.Rel(localDir, filePath)
+		if err != nil {
+			return nil
+		}
+
+		parts := strings.Split(relPath, string(filepath.Separator))
+		if len(parts) != 3 {
+			return nil
+		}
+
+		z, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return nil
+		}
+		x, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return nil
+		}
+		yStr := strings.TrimSuffix(parts[2], ".pbf")
+		y, err := strconv.Atoi(yStr)
+		if err != nil {
+			return nil
+		}
+
+		// Check if this tile coordinate is in our filter
+		if !coords[TileCoord{z, x, y}] {
+			return nil // Skip tiles not in filter
+		}
+
+		s3Key := filepath.Join(s3Prefix, filepath.ToSlash(relPath))
+
+		files = append(files, fileToUpload{
+			path:    filePath,
+			relPath: relPath,
+			s3Key:   s3Key,
+			size:    info.Size(),
+		})
+
+		return nil
+	})
+
+	if err != nil {
+		logger.Error("failed to scan directory", "error", err)
+		return 0, fmt.Errorf("failed to scan directory: %w", err)
+	}
+
+	logger.Info("found tiles matching filter", "count", len(files), "filter_count", len(coords))
+
+	// Upload files in parallel using worker pool
+	const numWorkers = 100
+	var totalBytes int64
+	var fileCount int
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	workChan := make(chan fileToUpload, numWorkers*2)
+	errChan := make(chan error, 1)
+
+	// Start workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			for file := range workChan {
+				f, err := os.Open(file.path)
+				if err != nil {
+					select {
+					case errChan <- fmt.Errorf("failed to open file %s: %w", file.relPath, err):
+					default:
+					}
+					return
+				}
+
+				_, err = s.uploader.Upload(ctx, &s3.PutObjectInput{
+					Bucket: aws.String(s.bucket),
+					Key:    aws.String(file.s3Key),
+					Body:   f,
+					ACL:    types.ObjectCannedACLPublicRead,
+				})
+				f.Close()
+
+				if err != nil {
+					select {
+					case errChan <- fmt.Errorf("failed to upload file %s: %w", file.relPath, err):
+					default:
+					}
+					return
+				}
+
+				mu.Lock()
+				totalBytes += file.size
+				fileCount++
+				currentCount := fileCount
+				currentBytes := totalBytes
+				mu.Unlock()
+
+				if currentCount%1000 == 0 {
+					logger.Info("upload progress", "files_uploaded", currentCount, "bytes_uploaded", currentBytes)
+				}
+			}
+		}(i)
+	}
+
+	// Send work to workers
+	go func() {
+		for _, file := range files {
+			select {
+			case <-ctx.Done():
+				return
+			case workChan <- file:
+			}
+		}
+		close(workChan)
+	}()
+
+	wg.Wait()
+	close(errChan)
+
+	if err := <-errChan; err != nil {
+		logger.Error("upload failed", "error", err)
+		return 0, err
+	}
+
+	logger.Info("filtered upload completed", "total_files", fileCount, "total_bytes", totalBytes)
 	return totalBytes, nil
 }
 

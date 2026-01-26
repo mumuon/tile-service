@@ -10,6 +10,9 @@ services:
       # Mount centralized data directories
       - ~/data/df/tiles:/app/tiles
       - ~/data/df/curvature-data:/app/curvature-data
+    # RAM-backed temp directory for faster tippecanoe processing
+    tmpfs:
+      - /tmp:size=2G
     environment:
       # Database configuration - loaded from .env file
       - DB_HOST=${DB_HOST}

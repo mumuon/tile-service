@@ -52,6 +52,7 @@ type GenerateRequest struct {
 	SkipGeneration        bool   `json:"skipGeneration"`
 	ExtractGeometry       bool   `json:"extractGeometry"`
 	SkipGeometryInsertion bool   `json:"skipGeometryInsertion"`
+	MergeAll              bool   `json:"mergeAll"` // Merge all regions instead of just overlapping neighbors (default: false)
 }
 
 // GenerateResponse represents the response to a generate request
@@ -77,6 +78,7 @@ type JobStatusResponse struct {
 	SkipGeneration        bool    `json:"skipGeneration"`
 	ExtractGeometry       bool    `json:"extractGeometry"`
 	SkipGeometryInsertion bool    `json:"skipGeometryInsertion"`
+	MergeAll              bool    `json:"mergeAll"`
 }
 
 // NewAPIServer creates a new API server
@@ -148,6 +150,7 @@ func (s *APIServer) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		NoCleanup:             false,
 		ExtractGeometry:       req.ExtractGeometry,
 		SkipGeometryInsertion: req.SkipGeometryInsertion,
+		MergeAll:              req.MergeAll, // Default false = merge only overlapping neighbors
 		CreatedAt:             time.Now(),
 		UpdatedAt:             time.Now(),
 	}
@@ -240,6 +243,7 @@ func (s *APIServer) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 		SkipGeneration:        status.Job.SkipGeneration,
 		ExtractGeometry:       status.Job.ExtractGeometry,
 		SkipGeometryInsertion: status.Job.SkipGeometryInsertion,
+		MergeAll:              status.Job.MergeAll,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -274,6 +278,7 @@ func (s *APIServer) handleListJobs(w http.ResponseWriter, r *http.Request) {
 			SkipGeneration:        status.Job.SkipGeneration,
 			ExtractGeometry:       status.Job.ExtractGeometry,
 			SkipGeometryInsertion: status.Job.SkipGeometryInsertion,
+			MergeAll:              status.Job.MergeAll,
 		})
 	}
 
@@ -528,6 +533,7 @@ func (s *APIServer) processJob(job *TileJob) {
 		NoCleanup:             job.NoCleanup,
 		ExtractGeometry:       job.ExtractGeometry,
 		SkipGeometryInsertion: job.SkipGeometryInsertion,
+		MergeAll:              job.MergeAll, // Default false = merge only overlapping neighbors
 	}
 
 	err := service.ProcessJobWithOptions(ctx, job, opts)
@@ -584,15 +590,15 @@ func (s *APIServer) createJob(ctx context.Context, job *TileJob) error {
 	query := `
 		INSERT INTO "TileJob" (
 			id, region, status, "maxZoom", "minZoom", "skipUpload", "skipGeneration",
-			"noCleanup", "extractGeometry", "skipGeometryInsertion",
+			"noCleanup", "extractGeometry", "skipGeometryInsertion", "mergeAll",
 			"createdAt", "updatedAt"
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`
 	_, err := s.db.conn.ExecContext(ctx, query,
 		job.ID, job.Region, job.Status,
 		job.MaxZoom, job.MinZoom, job.SkipUpload, job.SkipGeneration,
-		job.NoCleanup, job.ExtractGeometry, job.SkipGeometryInsertion,
+		job.NoCleanup, job.ExtractGeometry, job.SkipGeometryInsertion, job.MergeAll,
 		job.CreatedAt, job.UpdatedAt,
 	)
 	return err
@@ -602,7 +608,7 @@ func (s *APIServer) createJob(ctx context.Context, job *TileJob) error {
 func (s *APIServer) getJobFromDB(ctx context.Context, jobID string) (*TileJob, error) {
 	query := `
 		SELECT id, region, status, "maxZoom", "minZoom", "skipUpload", "skipGeneration",
-		       "noCleanup", "extractGeometry", "skipGeometryInsertion",
+		       "noCleanup", "extractGeometry", "skipGeometryInsertion", "mergeAll",
 		       "currentStep", "roadsExtracted", "tilesGenerated",
 		       "totalSizeBytes", "uploadProgress", "uploadedBytes", "errorMessage",
 		       "createdAt", "updatedAt", "startedAt", "completedAt"
@@ -614,7 +620,7 @@ func (s *APIServer) getJobFromDB(ctx context.Context, jobID string) (*TileJob, e
 	err := s.db.conn.QueryRowContext(ctx, query, jobID).Scan(
 		&job.ID, &job.Region, &job.Status,
 		&job.MaxZoom, &job.MinZoom, &job.SkipUpload, &job.SkipGeneration,
-		&job.NoCleanup, &job.ExtractGeometry, &job.SkipGeometryInsertion,
+		&job.NoCleanup, &job.ExtractGeometry, &job.SkipGeometryInsertion, &job.MergeAll,
 		&job.CurrentStep,
 		&job.RoadsExtracted, &job.TilesGenerated, &job.TotalSizeBytes,
 		&job.UploadProgress, &job.UploadedBytes, &job.ErrorMessage,

@@ -14,6 +14,7 @@ type TileJob struct {
 	NoCleanup             bool
 	ExtractGeometry       bool
 	SkipGeometryInsertion bool
+	MergeAll              bool // Merge all regions instead of just overlapping neighbors
 	CurrentStep           *string
 	RoadsExtracted        *int
 	TilesGenerated        *int
@@ -84,7 +85,9 @@ type JobOptions struct {
 	MinZoom               int
 	SkipUpload            bool
 	SkipGeneration        bool // Skip tile generation, only upload existing tiles
+	SkipMerge             bool // Skip merging with other regions (useful for batch processing)
 	NoCleanup             bool
 	ExtractGeometry       bool // Extract road geometries into database for nearby roads feature
 	SkipGeometryInsertion bool // Extract to file but don't insert into database
+	MergeAll              bool // Merge all regions instead of just overlapping neighbors
 }
