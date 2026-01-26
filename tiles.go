@@ -26,7 +26,7 @@ func GenerateTiles(ctx context.Context, geoJSONPath, region string, outputBaseDi
 // GenerateTilesWithOptions generates vector tiles with configurable zoom levels
 func GenerateTilesWithOptions(ctx context.Context, geoJSONPath, region string, outputBaseDir string, opts *GenerateTilesOptions) (string, int, int64, error) {
 	// Default zoom levels
-	minZoom := 5
+	minZoom := 0
 	maxZoom := 16
 	if opts != nil {
 		if opts.MinZoom >= 0 {
@@ -40,10 +40,22 @@ func GenerateTilesWithOptions(ctx context.Context, geoJSONPath, region string, o
 	logger := slog.With("region", region, "geojson", geoJSONPath, "min_zoom", minZoom, "max_zoom", maxZoom)
 	logger.Info("generating tiles with Tippecanoe")
 
-	// Create output directory - must fully remove old tiles to prevent stale data
+	// Clean output directory before generation.
+	// If generating a partial zoom range, only remove those zoom directories
+	// to preserve tiles outside the range. For full range, wipe everything.
 	tilesDir := filepath.Join(outputBaseDir, region)
-	if err := removeDirectoryContents(tilesDir); err != nil {
-		return "", 0, 0, fmt.Errorf("failed to clean tiles directory: %w", err)
+	if minZoom == 0 && maxZoom == 16 {
+		if err := removeDirectoryContents(tilesDir); err != nil {
+			return "", 0, 0, fmt.Errorf("failed to clean tiles directory: %w", err)
+		}
+	} else {
+		// Partial range: only remove zoom directories being regenerated
+		for z := minZoom; z <= maxZoom; z++ {
+			zoomDir := filepath.Join(tilesDir, strconv.Itoa(z))
+			if err := os.RemoveAll(zoomDir); err != nil && !os.IsNotExist(err) {
+				return "", 0, 0, fmt.Errorf("failed to clean zoom %d directory: %w", z, err)
+			}
+		}
 	}
 
 	if err := os.MkdirAll(tilesDir, 0755); err != nil {
@@ -106,13 +118,6 @@ func GenerateTilesWithOptions(ctx context.Context, geoJSONPath, region string, o
 		"total_size_bytes", totalSize,
 	)
 
-	// Copy tiles to parent directory for compatibility
-	parentDir := filepath.Dir(tilesDir)
-	if err := copyTilesToParent(tilesDir, parentDir, logger); err != nil {
-		logger.Warn("failed to copy tiles to parent directory", "error", err)
-		// Don't fail the job, just log the warning
-	}
-
 	return tilesDir, tilesCount, totalSize, nil
 }
 
@@ -169,7 +174,7 @@ func GetTileMetadata(tilesDir string) (*TileMetadata, error) {
 	return &TileMetadata{
 		TilesCount: tilesCount,
 		TotalSize:  totalSize,
-		MinZoom:    5,
+		MinZoom:    0,
 		MaxZoom:    16,
 	}, nil
 }
@@ -297,7 +302,9 @@ func MergeTiles(ctx context.Context, inputDirs []string, outputDir string) (*Til
 	return MergeTilesWithOptions(ctx, inputDirs, outputDir, nil)
 }
 
-// MergeTilesWithOptions merges tiles with optional zoom filtering
+// MergeTilesWithOptions merges tiles with optional zoom filtering.
+// Uses a safe temp-dir swap: merges into outputDir.tmp, then atomically swaps
+// with the old outputDir so that a failed merge doesn't destroy existing data.
 func MergeTilesWithOptions(ctx context.Context, inputDirs []string, outputDir string, opts *MergeTilesOptions) (*TileMetadata, error) {
 	logger := slog.With("output_dir", outputDir, "input_count", len(inputDirs))
 	if opts != nil && (opts.MinZoom >= 0 || opts.MaxZoom >= 0) {
@@ -309,13 +316,16 @@ func MergeTilesWithOptions(ctx context.Context, inputDirs []string, outputDir st
 		return nil, fmt.Errorf("no input directories provided for merge")
 	}
 
-	// Clean output directory to ensure fresh merge
-	if err := removeDirectoryContents(outputDir); err != nil {
-		return nil, fmt.Errorf("failed to clean merged directory: %w", err)
-	}
+	// Merge into a temp directory so a failed merge doesn't destroy existing data
+	tmpDir := outputDir + ".tmp"
+	oldDir := outputDir + ".old"
 
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create merged directory: %w", err)
+	// Clean up any leftover temp/old dirs from previous runs
+	os.RemoveAll(tmpDir)
+	os.RemoveAll(oldDir)
+
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create temp merge directory: %w", err)
 	}
 
 	// Build tile-join command
@@ -325,7 +335,7 @@ func MergeTilesWithOptions(ctx context.Context, inputDirs []string, outputDir st
 		"--force",
 		"--no-tile-compression",
 		"--no-tile-size-limit",
-		fmt.Sprintf("--output-to-directory=%s", outputDir),
+		fmt.Sprintf("--output-to-directory=%s", tmpDir),
 	}
 
 	// Add zoom filtering if specified
@@ -351,11 +361,44 @@ func MergeTilesWithOptions(ctx context.Context, inputDirs []string, outputDir st
 	// Capture output for debugging
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		logger.Error("tile-join failed", "error", err, "output", string(output))
+		logger.Error("tile-join failed, preserving existing merged data", "error", err, "output", string(output))
+		os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("tile-join merge failed: %w", err)
 	}
 
 	logger.Debug("tile-join output", "output", string(output))
+
+	// Verify the temp dir has tiles before swapping
+	tmpTileCount, err := countTiles(tmpDir)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("failed to count tiles in temp merge dir: %w", err)
+	}
+	if tmpTileCount == 0 {
+		os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("tile-join produced no tiles, preserving existing merged data")
+	}
+
+	logger.Info("merge produced tiles, performing atomic swap", "tile_count", tmpTileCount)
+
+	// Atomic swap: old → .old, tmp → final, remove .old
+	if _, err := os.Stat(outputDir); err == nil {
+		if err := os.Rename(outputDir, oldDir); err != nil {
+			os.RemoveAll(tmpDir)
+			return nil, fmt.Errorf("failed to move old merged dir: %w", err)
+		}
+	}
+
+	if err := os.Rename(tmpDir, outputDir); err != nil {
+		// Try to restore old dir
+		if _, statErr := os.Stat(oldDir); statErr == nil {
+			os.Rename(oldDir, outputDir)
+		}
+		return nil, fmt.Errorf("failed to move temp merge dir to final: %w", err)
+	}
+
+	// Clean up old dir
+	os.RemoveAll(oldDir)
 
 	// Get metadata about merged tiles
 	metadata, err := GetTileMetadata(outputDir)

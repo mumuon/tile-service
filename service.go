@@ -251,6 +251,20 @@ func (s *TileService) ProcessJobWithOptions(ctx context.Context, job *TileJob, o
 				logger.Warn("failed to update progress", "error", err)
 			}
 		}
+
+		// Verify generated tiles have all expected zoom levels (hard fail)
+		tileReport, err := VerifyTileDirectory(tilesDir, opts.MinZoom, opts.MaxZoom)
+		if err != nil {
+			logger.Warn("tile verification error", "error", err)
+		} else if !tileReport.OK {
+			tileReport.Print()
+			if s.db != nil {
+				s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("generated tiles missing zoom levels: %v", tileReport.MissingZooms))
+			}
+			return fmt.Errorf("generated tiles missing zoom levels: %v", tileReport.MissingZooms)
+		} else {
+			logger.Info("tile integrity check passed", "zoom_levels", len(tileReport.ZoomStats))
+		}
 	}
 
 	// Phase 4: Merge regional tiles
@@ -297,6 +311,17 @@ func (s *TileService) ProcessJobWithOptions(ctx context.Context, job *TileJob, o
 			return fmt.Errorf("failed to merge tiles: %w", err)
 		}
 		logger.Info("tiles merged", "regions", len(regionDirs), "tiles_count", mergeMetadata.TilesCount, "size_bytes", mergeMetadata.TotalSize)
+
+		// Verify merge integrity (warn only — don't block pipeline)
+		mergeReport, err := VerifyMergeIntegrity(tilesDir, mergedDir)
+		if err != nil {
+			logger.Warn("merge verification error", "error", err)
+		} else {
+			mergeReport.Print()
+			if !mergeReport.OK {
+				logger.Warn("merge integrity check found missing tiles", "count", len(mergeReport.MissingTiles))
+			}
+		}
 	}
 
 	// Phase 5 & 6: Run geometry extraction and R2 upload in parallel
@@ -404,6 +429,19 @@ func (s *TileService) ProcessJobWithOptions(ctx context.Context, job *TileJob, o
 			s.db.UpdateJobError(ctx, job.ID, fmt.Sprintf("R2 upload failed: %v", uploadRes.err))
 		}
 		return fmt.Errorf("failed to upload to R2: %w", uploadRes.err)
+	}
+
+	// Verify upload spot-check (warn only — don't block pipeline)
+	if !opts.SkipUpload && s.s3 != nil && mergedDir != "" {
+		uploadReport, err := VerifyUpload(ctx, s.s3, mergedDir, s.config.S3.BucketPath, 3)
+		if err != nil {
+			logger.Warn("upload verification error", "error", err)
+		} else {
+			uploadReport.Print()
+			if !uploadReport.OK {
+				logger.Warn("upload verification found missing tiles on R2", "count", len(uploadReport.Missing))
+			}
+		}
 	}
 
 	// Geometry extraction errors are non-fatal (we already logged them)

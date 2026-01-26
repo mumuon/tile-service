@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -465,6 +466,34 @@ func (s *S3Client) ListObjects(ctx context.Context, prefix string) ([]string, er
 
 	logger.Debug("objects listed", "count", len(objects))
 	return objects, nil
+}
+
+// HeadObject checks if an object exists in S3 and returns its size.
+// Returns (size, exists, error). If the object doesn't exist, exists is false and error is nil.
+func (s *S3Client) HeadObject(ctx context.Context, s3Key string) (int64, bool, error) {
+	result, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s3Key),
+	})
+	if err != nil {
+		// Check if the error is a "not found" type
+		var notFound *types.NotFound
+		if ok := errors.As(err, &notFound); ok {
+			return 0, false, nil
+		}
+		// Also check for 404 status code in generic API errors
+		var apiErr smithy.APIError
+		if ok := errors.As(err, &apiErr); ok && apiErr.ErrorCode() == "NotFound" {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("failed to head object %s: %w", s3Key, err)
+	}
+
+	var size int64
+	if result.ContentLength != nil {
+		size = *result.ContentLength
+	}
+	return size, true, nil
 }
 
 // GetPublicURL returns the public URL for an object

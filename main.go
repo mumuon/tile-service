@@ -52,6 +52,8 @@ func main() {
 		cmdMerge(args[1:], configPath, debug)
 	} else if command == "serve" {
 		cmdServe(args[1:], configPath, debug)
+	} else if command == "verify" {
+		cmdVerify(args[1:], configPath, debug)
 	} else {
 		slog.Error("unknown command", "command", command)
 		showHelp()
@@ -63,7 +65,7 @@ func main() {
 func cmdGenerate(args []string, configPath *string, debug *bool) {
 	fs := flag.NewFlagSet("generate", flag.ExitOnError)
 	maxZoom := fs.Int("max-zoom", 16, "Maximum zoom level for tiles")
-	minZoom := fs.Int("min-zoom", 5, "Minimum zoom level for tiles")
+	minZoom := fs.Int("min-zoom", 0, "Minimum zoom level for tiles")
 	skipUpload := fs.Bool("skip-upload", false, "Skip R2 upload")
 	skipMerge := fs.Bool("skip-merge", false, "Skip merging with other regions (for batch processing)")
 	noCleanup := fs.Bool("no-cleanup", false, "Don't cleanup temporary files")
@@ -288,7 +290,7 @@ func cmdUpload(args []string, configPath *string, debug *bool) {
 	// Run upload
 	done := make(chan error, 1)
 	go func() {
-		// Extract region from directory name (e.g., "public/tiles/oregon" -> "oregon")
+		// Extract region from directory name (e.g., "~/data/df/tiles/oregon" -> "oregon")
 		region := filepath.Base(tilesDir)
 		uploadedBytes, err := service.UploadToR2WithZoomFilter(ctx, tilesDir, region, *minZoom, *maxZoom)
 		if err != nil {
@@ -326,7 +328,7 @@ func cmdExtract(args []string, configPath *string, debug *bool) {
 	}
 	tilesDir := parsedArgs[0]
 
-	// Extract region from directory path (e.g., "public/tiles/oregon" -> "oregon")
+	// Extract region from directory path (e.g., "~/data/df/tiles/oregon" -> "oregon")
 	region := filepath.Base(tilesDir)
 
 	// Load configuration
@@ -670,6 +672,152 @@ func cmdServe(args []string, configPath *string, debug *bool) {
 	}
 }
 
+// reorderFlagsFirst moves flag arguments before positional arguments so Go's
+// flag package parses them correctly. Go's flag stops at the first non-flag arg.
+// This allows "verify tiles <dir> --min-zoom 0" to work like "--min-zoom 0 <dir>".
+func reorderFlagsFirst(args []string) []string {
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		if strings.HasPrefix(args[i], "-") {
+			flags = append(flags, args[i])
+			// If flag uses "--key value" form (not "--key=value"), grab the next arg as the value
+			if !strings.Contains(args[i], "=") && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		} else {
+			positional = append(positional, args[i])
+		}
+	}
+	return append(flags, positional...)
+}
+
+// cmdVerify handles tile verification commands
+func cmdVerify(args []string, configPath *string, debug *bool) {
+	if len(args) == 0 {
+		slog.Error("verify subcommand required: tiles, merge, or upload")
+		os.Exit(1)
+	}
+
+	subcommand := args[0]
+	subArgs := args[1:]
+
+	switch subcommand {
+	case "tiles":
+		cmdVerifyTiles(subArgs)
+	case "merge":
+		cmdVerifyMerge(subArgs, configPath)
+	case "upload":
+		cmdVerifyUpload(subArgs, configPath)
+	default:
+		slog.Error("unknown verify subcommand", "subcommand", subcommand)
+		slog.Info("available: tiles, merge, upload")
+		os.Exit(1)
+	}
+}
+
+func cmdVerifyTiles(args []string) {
+	fs := flag.NewFlagSet("verify tiles", flag.ExitOnError)
+	minZoom := fs.Int("min-zoom", 0, "Minimum expected zoom level")
+	maxZoom := fs.Int("max-zoom", 16, "Maximum expected zoom level")
+	fs.Parse(reorderFlagsFirst(args))
+
+	parsedArgs := fs.Args()
+	if len(parsedArgs) == 0 {
+		slog.Error("tiles directory required")
+		slog.Info("Usage: tile-service verify tiles <dir> [--min-zoom N] [--max-zoom N]")
+		os.Exit(1)
+	}
+	dir := parsedArgs[0]
+
+	report, err := VerifyTileDirectory(dir, *minZoom, *maxZoom)
+	if err != nil {
+		slog.Error("verification failed", "error", err)
+		os.Exit(1)
+	}
+
+	report.Print()
+
+	if !report.OK {
+		os.Exit(1)
+	}
+}
+
+func cmdVerifyMerge(args []string, configPath *string) {
+	fs := flag.NewFlagSet("verify merge", flag.ExitOnError)
+	fs.Parse(args)
+
+	parsedArgs := fs.Args()
+	if len(parsedArgs) == 0 {
+		slog.Error("region required")
+		slog.Info("Usage: tile-service verify merge <region>")
+		os.Exit(1)
+	}
+	region := parsedArgs[0]
+
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		slog.Error("failed to load config", "error", err)
+		os.Exit(1)
+	}
+
+	regionDir := filepath.Join(cfg.Paths.OutputDir, region)
+	mergedDir := filepath.Join(cfg.Paths.OutputDir, "merged")
+
+	report, err := VerifyMergeIntegrity(regionDir, mergedDir)
+	if err != nil {
+		slog.Error("merge verification failed", "error", err)
+		os.Exit(1)
+	}
+
+	report.Print()
+
+	if !report.OK {
+		os.Exit(1)
+	}
+}
+
+func cmdVerifyUpload(args []string, configPath *string) {
+	fs := flag.NewFlagSet("verify upload", flag.ExitOnError)
+	samplesPerZoom := fs.Int("samples-per-zoom", 5, "Number of tiles to spot-check per zoom level")
+	fs.Parse(reorderFlagsFirst(args))
+
+	parsedArgs := fs.Args()
+	if len(parsedArgs) == 0 {
+		slog.Error("region required")
+		slog.Info("Usage: tile-service verify upload <region> [--samples-per-zoom N]")
+		os.Exit(1)
+	}
+	region := parsedArgs[0]
+
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		slog.Error("failed to load config", "error", err)
+		os.Exit(1)
+	}
+
+	s3Client, err := NewS3Client(cfg.S3)
+	if err != nil {
+		slog.Error("failed to initialize S3 client", "error", err)
+		os.Exit(1)
+	}
+
+	tilesDir := filepath.Join(cfg.Paths.OutputDir, region)
+	ctx := context.Background()
+
+	report, err := VerifyUpload(ctx, s3Client, tilesDir, cfg.S3.BucketPath, *samplesPerZoom)
+	if err != nil {
+		slog.Error("upload verification failed", "error", err)
+		os.Exit(1)
+	}
+
+	report.Print()
+
+	if !report.OK {
+		os.Exit(1)
+	}
+}
+
 func showHelp() {
 	help := `Tile Service - Generate vector tiles from road geometry data
 
@@ -687,6 +835,7 @@ Commands:
   extract               Extract road geometries from existing tiles into database
   insert-geometries     Insert extracted road geometries from file into database
   merge                 Merge regional tiles and upload to R2
+  verify                Verify tile integrity, merge completeness, or upload status
   serve                 Start the REST API server
 
 Generate Command:
@@ -697,8 +846,8 @@ Generate Command:
 
   Options:
     -max-zoom int         Maximum zoom level (default 16)
-    -min-zoom int         Minimum zoom level (default 5)
-    -skip-upload          Skip R2 upload, keep tiles locally in ./public/tiles
+    -min-zoom int         Minimum zoom level (default 0)
+    -skip-upload          Skip R2 upload, keep tiles locally in ~/data/df/tiles
     -skip-merge           Skip merging with other regions (for batch processing)
     -no-cleanup           Don't cleanup temporary files after completion
     -extract-geometry     Extract road geometries into database (default true)
@@ -710,7 +859,7 @@ Upload Command:
   Usage: tile-service upload [options] <tiles_directory>
 
   Arguments:
-    <tiles_directory>     Path to the tiles directory to upload (e.g., public/tiles/oregon)
+    <tiles_directory>     Path to the tiles directory to upload (e.g., ~/data/df/tiles/oregon)
 
   Options:
     -min-zoom int         Minimum zoom level to upload (-1 = all, default -1)
@@ -720,7 +869,7 @@ Extract Command:
   Usage: tile-service extract <tiles_directory>
 
   Arguments:
-    <tiles_directory>     Path to the tiles directory (e.g., public/tiles/oregon)
+    <tiles_directory>     Path to the tiles directory (e.g., ~/data/df/tiles/oregon)
 
   Description:
     Extracts road bounding boxes from vector tiles and stores them in the database.
@@ -763,6 +912,33 @@ Merge Command:
     - Manual control over which regions to include in the merged output
     - Using --for to efficiently merge only neighboring regions
 
+Verify Command:
+  Usage: tile-service verify <subcommand> [options] [arguments]
+
+  Subcommands:
+    tiles                 Verify tile directory has all expected zoom levels
+    merge                 Verify merge completeness for a region
+    upload                Spot-check that tiles exist on R2
+
+  Verify Tiles:
+    Usage: tile-service verify tiles <dir> [--min-zoom N] [--max-zoom N]
+
+    Options:
+      -min-zoom int         Minimum expected zoom level (default 0)
+      -max-zoom int         Maximum expected zoom level (default 16)
+
+  Verify Merge:
+    Usage: tile-service verify merge <region>
+
+  Verify Upload:
+    Usage: tile-service verify upload <region> [--samples-per-zoom N]
+
+    Options:
+      -samples-per-zoom int Number of tiles to spot-check per zoom level (default 5)
+
+  Description:
+    Exits 0 if verification passes, 1 if issues are found.
+
 Serve Command:
   Usage: tile-service serve [options]
 
@@ -800,16 +976,16 @@ Examples:
   ./tile-service merge
 
   # Upload pre-generated tiles
-  ./tile-service upload public/tiles/oregon
+  ./tile-service upload ~/data/df/tiles/oregon
 
   # Upload only the most zoomed-out level
-  ./tile-service upload -min-zoom 5 -max-zoom 5 public/tiles/oregon
+  ./tile-service upload -min-zoom 5 -max-zoom 5 ~/data/df/tiles/oregon
 
   # Upload zoom levels 7-12
-  ./tile-service upload -min-zoom 7 -max-zoom 12 public/tiles/oregon
+  ./tile-service upload -min-zoom 7 -max-zoom 12 ~/data/df/tiles/oregon
 
   # Extract road geometries from existing tiles
-  ./tile-service extract public/tiles/oregon
+  ./tile-service extract ~/data/df/tiles/oregon
 
   # Generate tiles and extract geometries to file (don't insert yet)
   ./tile-service generate -skip-upload -skip-geometry-insertion florida
@@ -839,6 +1015,15 @@ Examples:
 
   # Start the REST API server on a custom port
   ./tile-service serve -port 3000
+
+  # Verify tiles have all expected zoom levels
+  ./tile-service verify tiles ~/data/df/tiles/arkansas --min-zoom 0 --max-zoom 16
+
+  # Verify merge completeness for a region
+  ./tile-service verify merge arkansas
+
+  # Spot-check uploaded tiles on R2
+  ./tile-service verify upload arkansas --samples-per-zoom 10
 
   # Debug mode
   ./tile-service -debug generate -max-zoom 8 washington

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -64,6 +65,12 @@ func LoadConfig(envPath string) (*Config, error) {
 		}
 	}
 
+	// Default output to ~/data/df/tiles (not ./public/tiles)
+	defaultOutputDir := "./public/tiles"
+	if home, err := os.UserHomeDir(); err == nil {
+		defaultOutputDir = filepath.Join(home, "data", "df", "tiles")
+	}
+
 	cfg := &Config{
 		Database: DatabaseConfig{
 			Host:     getEnv("DB_HOST", "localhost"),
@@ -84,7 +91,7 @@ func LoadConfig(envPath string) (*Config, error) {
 		Paths: PathsConfig{
 			CurvatureData: getEnv("CURVATURE_DATA_DIR", "./curvature-data"),
 			TempDir:       getEnv("TEMP_DIR", "/tmp"),
-			OutputDir:     getEnv("OUTPUT_DIR", "./public/tiles"),
+			OutputDir:     getEnv("OUTPUT_DIR", defaultOutputDir),
 		},
 		Service: ServiceConfig{
 			Workers:     getEnvInt("WORKERS", 3),
