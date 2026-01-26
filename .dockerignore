@@ -3,19 +3,30 @@ tiles/
 *.mbtiles
 
 # Ignore local environment files
-.env.local
-.env
+.env*
 
 # Ignore build artifacts
 tile-service
+tile-service-*
+bin/
+cmd/
+
+# Ignore data directories
+curvature-data/
+test-tiles/
 
 # Ignore git
 .git
 .gitignore
 
+# Ignore docs (not needed for build)
+docs/
+
 # Ignore extracted roads files
 .extracted-roads-*.json
+.extract-progress-*.json
 
 # Ignore temporary files
 *.tmp
 *.log
+*.kml

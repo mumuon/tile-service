@@ -23,8 +23,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=1 GOOS=linux go build -o tile-service .
 
-# Stage 2: Build tippecanoe
-FROM alpine:latest AS tippecanoe-builder
+# Stage 2: Build tippecanoe (pinned Alpine version to preserve layer cache)
+FROM alpine:3.21 AS tippecanoe-builder
 
 # Install build dependencies for tippecanoe
 RUN apk add --no-cache \
@@ -41,7 +41,7 @@ RUN git clone --depth 1 --branch 2.72.0 https://github.com/felt/tippecanoe.git /
     make install
 
 # Stage 3: Runtime environment
-FROM alpine:latest
+FROM alpine:3.21
 
 # Install runtime dependencies
 # - PostgreSQL client libraries for database connectivity
