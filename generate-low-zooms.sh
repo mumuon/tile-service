@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY="$SCRIPT_DIR/tile-service"
 TILES_BASE="${TILES_DIR:-$HOME/data/df/tiles}"
 MIN_ZOOM=0
-MAX_ZOOM=5
+MAX_ZOOM=6
 WORKERS=10
 
 # Build if needed

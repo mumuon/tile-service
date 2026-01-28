@@ -71,7 +71,7 @@ func GenerateTilesWithOptions(ctx context.Context, geoJSONPath, region string, o
 		"--temporary-directory=/tmp",
 		fmt.Sprintf("--minimum-zoom=%d", minZoom),
 		fmt.Sprintf("--maximum-zoom=%d", maxZoom),
-		"--drop-fraction-as-needed",
+		"--drop-densest-as-needed",
 		"--extend-zooms-if-still-dropping",
 		"--layer=roads",
 		fmt.Sprintf("--name=%s Curvy Roads", region),
