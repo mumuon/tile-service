@@ -2,11 +2,27 @@
 .env.local
 .env.*.local
 .env.production
-tile-service
 *.log
-public/tiles/
 /tmp/
+
+# Binaries
+tile-service
+tile-service-*
+bin/
+cmd/*/analyze-tiles
+
+# Tile data
+public/tiles/
+tiles/
+test-tiles/
+
+# Temp files
+temp-*.kml
+temp-*.geojson
 
 # Extraction progress files
 .extract-progress-*.json
 .extracted-roads-*.json
+
+# macOS
+.DS_Store
