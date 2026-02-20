@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	converter "github.com/mumuon/drivefinder/tile-service"
+	"github.com/mumuon/drivefinder/tile-service/kmlconv"
 )
 
 func main() {
@@ -24,7 +24,7 @@ func main() {
 	region := strings.TrimSuffix(filepath.Base(kmlPath), filepath.Ext(kmlPath))
 
 	ctx := context.Background()
-	geojsonPath, count, err := converter.ConvertKMLToGeoJSON(ctx, kmlPath, region)
+	geojsonPath, count, err := kmlconv.ConvertKMLToGeoJSON(ctx, kmlPath, region)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
