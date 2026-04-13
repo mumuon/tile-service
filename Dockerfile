@@ -12,15 +12,16 @@ WORKDIR /build
 COPY go.mod go.sum ./
 
 # Download dependencies
-RUN --mount=type=cache,target=/go/pkg/mod \
+# Note: cache mounts require explicit id= for Railway BuildKit
+RUN --mount=type=cache,id=tile-go-mod,target=/go/pkg/mod \
     go mod download
 
 # Copy source code
 COPY *.go ./
 
 # Build the binary
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,id=tile-go-mod,target=/go/pkg/mod \
+    --mount=type=cache,id=tile-go-build,target=/root/.cache/go-build \
     CGO_ENABLED=1 GOOS=linux go build -o tile-service .
 
 # Stage 2: Build tippecanoe (pinned Alpine version to preserve layer cache)
