@@ -12,16 +12,19 @@ WORKDIR /build
 COPY go.mod go.sum ./
 
 # Download dependencies
-# Note: cache mounts removed — Railway BuildKit requires service-specific
-# cache key prefixes that aren't portable across environments. Without
-# cache the build is ~30-60s slower; acceptable for this service.
-RUN go mod download
+# Cache mount id requires Railway's "s/<service-id>-..." prefix when built
+# on Railway BuildKit (works fine on local Docker too — id is just a name).
+RUN --mount=type=cache,id=s/a925b0e3-a9ff-4698-9831-a3560464e9ce-go-mod,target=/go/pkg/mod \
+    go mod download
 
-# Copy source code
+# Copy source code (top-level .go files + local subpackages)
 COPY *.go ./
+COPY kmlconv/ ./kmlconv/
 
 # Build the binary
-RUN CGO_ENABLED=1 GOOS=linux go build -o tile-service .
+RUN --mount=type=cache,id=s/a925b0e3-a9ff-4698-9831-a3560464e9ce-go-mod,target=/go/pkg/mod \
+    --mount=type=cache,id=s/a925b0e3-a9ff-4698-9831-a3560464e9ce-go-build,target=/root/.cache/go-build \
+    CGO_ENABLED=1 GOOS=linux go build -o tile-service .
 
 # Stage 2: Build tippecanoe (pinned Alpine version to preserve layer cache)
 FROM alpine:3.21 AS tippecanoe-builder
