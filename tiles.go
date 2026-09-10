@@ -74,6 +74,15 @@ func GenerateTilesWithOptions(ctx context.Context, geoJSONPath, region string, o
 	// lowest-curvature roads first and uniformly, so the same top roads survive at
 	// every zoom. Requires the "curvature" GeoJSON property to be numeric, not a
 	// string, or tippecanoe falls back to lexicographic ordering (see kmlconv.go).
+	//
+	// --maximum-tile-bytes=1500000: ordering alone still let --drop-densest-as-needed
+	// evict some top-curvature roads at z6-8 once a region is dense enough to hit
+	// tippecanoe's default 500KB per-tile budget — the drop is byte-size driven, not
+	// detail driven (--minimum-detail and --drop-rate have no effect once
+	// --drop-densest-as-needed is active; it only reacts to tile size). Raising the
+	// budget to 1.5MB (3x default) lets those low-zoom tiles hold the full
+	// importance-ranked set without dropping, verified against a local tippecanoe
+	// v2.79.0 stress rig (see DECISIONS.md).
 	cmd := exec.CommandContext(ctx, "tippecanoe",
 		"--force",
 		fmt.Sprintf("--output-to-directory=%s", tilesDir),
@@ -84,6 +93,7 @@ func GenerateTilesWithOptions(ctx context.Context, geoJSONPath, region string, o
 		"--drop-densest-as-needed",
 		"--extend-zooms-if-still-dropping",
 		"--order-descending-by=curvature",
+		"--maximum-tile-bytes=1500000",
 		"--layer=roads",
 		fmt.Sprintf("--name=%s Curvy Roads", region),
 		"--attribution=Data © OpenStreetMap contributors",

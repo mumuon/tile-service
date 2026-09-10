@@ -88,4 +88,63 @@ stored values go from e.g. `"1000"` to `"1000.00"`.
 
 ---
 
+### 2026-09-10: Raise Tippecanoe's per-tile byte budget to stop byte-size-driven drops of top-curvature roads at z6-8
+
+**Context**: The 2026-09-09 fix (order drops by curvature) made the *set* of roads
+dropped at each zoom consistent and importance-ranked, but did not stop drops from
+happening: 15/20 of the top-20 highest-curvature roads survived at z8, a real
+improvement over 13/20 but still short of full zoom stability. Morning-review
+decision 11 asked for the same feature-overlap metric to reach ≥18/20 at z8, via
+one of: `--drop-rate` tuning, per-zoom `--minimum-detail`, or raising the tile-size
+limit for the roads layer.
+
+**Decision**: Add `--maximum-tile-bytes=1500000` to the `tiles.go` Tippecanoe
+invocation (up from Tippecanoe's 500KB default). `--drop-rate` and
+`--minimum-detail` were tried first and ruled out — both are inert once
+`--drop-densest-as-needed` is driving the drop decision, because that flag drops
+purely to fit the tile's byte budget, not based on a target detail level or a
+per-zoom retention rate. The byte budget was the actual constraint causing drops,
+so it's the lever that has to move.
+
+**Reasoning**: Verified locally against a real tippecanoe v2.79.0 binary. Built a
+denser synthetic stress rig than the 2026-09-09 proof (6,000 clustered LineStrings,
+15-40 vertices each, same z6/7/8 tile lineage pattern: 6/10/22 → 7/20/45 → 8/41/91)
+specifically so the default 500KB budget would still be triggering real drops even
+with curvature-ordering in place (baseline reproduced 6/20 top-curvature roads
+surviving at z8 under this harsher load — worse than the 15/20 seen in production
+regions, because the synthetic data is deliberately denser to make the byte-budget
+effect visible). Results holding minimum/maximum-zoom, ordering, and
+drop-densest-as-needed constant, varying only the extra flag:
+
+| Variant | z8 retention (top-20) | Total tile-dir size |
+|---|---|---|
+| baseline (500KB default) | 6/20 | 9.1M |
+| `--drop-rate=1` | 6/20 (no change) | 9.1M |
+| `--minimum-detail=4` or `=6` | 6/20 (no change) | 9.1M |
+| `--maximum-tile-bytes=600000` | 8/20 | 6.2M |
+| `--maximum-tile-bytes=750000` | 12/20 | 7.1M |
+| `--maximum-tile-bytes=1000000` | 18/20 | 6.1M |
+| `--maximum-tile-bytes=1200000`+ | 20/20 (no drops needed) | 3.1M |
+
+Shipped at 1.5MB — comfortably past the 1.2MB point where this rig stopped
+dropping at all, giving margin for real regions denser than the synthetic case
+without sitting exactly on the threshold.
+
+**Consequences**: Low-zoom (z6-8) roads tiles for dense curvy-road regions can now
+be up to 3x larger than before (1.5MB vs 500KB) before Tippecanoe drops anything.
+At z6-8 a viewport typically holds a handful of tiles, so worst case is a few MB of
+one-time overlay load, not a per-tile-zoom-level cost multiplied across many tiles
+the way it would be at z14-16. This only affects the roads layer's own Tippecanoe
+invocation (`tiles.go`); the Overture buildings job already uses distinct
+completeness flags with no dropping and is unaffected. As with the 2026-09-09 fix,
+this only takes effect the next time a region is regenerated — regenerating live
+Railway regions remains an owner-gated, prod-first step, not part of this change.
+
+**References**:
+- Files changed: `tiles.go`
+- Changelog: See CHANGELOG.md entry for 2026-09-10
+- Related decisions: [Order tippecanoe drops by curvature to fix flaky zoom-level rendering](#2026-09-09-order-tippecanoe-drops-by-curvature-to-fix-flaky-zoom-level-rendering)
+
+---
+
 <!-- Add new decisions above this line, newest first -->

@@ -6,6 +6,22 @@ A chronological summary of all changes made to the tile-service.
 
 ## September 2026
 
+### Raise per-tile byte budget for curvy-roads at low zoom (Sep 10)
+- `tiles.go`: added `--maximum-tile-bytes=1500000` (3x tippecanoe's 500KB default) to
+  the roads-layer Tippecanoe invocation
+- Follow-up to the Sep 9 ordering fix: `--order-descending-by=curvature` made drops
+  *consistent* but a dense enough region still hit the default tile byte budget and
+  lost some top-curvature roads at z6-8 — the drop was byte-size driven, not detail
+  driven, so `--minimum-detail`/`--drop-rate` had no effect once
+  `--drop-densest-as-needed` was already active. Raising the budget lets those tiles
+  hold the full importance-ranked set without dropping.
+- Local tippecanoe v2.79.0 stress rig (synthetic dense cluster, same z6/z7/z8 tile
+  lineage): top-20 curvature-road retention went from 6/20 (baseline, 500KB) to
+  18/20 at 1MB and 20/20 at ≥1.2MB, at z8. Shipped at 1.5MB for margin above the
+  observed 20/20 threshold. `--drop-rate` and `--minimum-detail` tuning were tried
+  first and made no measurable difference (see DECISIONS.md).
+- go build/vet/test green
+
 ### Overture buildings job, run locally only (Sep 10)
 - Added `generate-buildings` CLI command + `overture.go`: downloads an Overture buildings
   extract for a bbox via the `overturemaps` CLI, builds a single PMTiles archive with
