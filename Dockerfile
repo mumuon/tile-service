@@ -52,7 +52,13 @@ FROM alpine:3.21
 # - wget for health checks
 # - sqlite-libs and zlib for tippecanoe runtime
 # - libstdc++ and libgcc for C++ runtime (needed by tippecanoe)
-RUN apk add --no-cache postgresql-client ca-certificates wget sqlite-libs zlib libstdc++ libgcc
+# - python3/py3-pip for the overturemaps CLI (generate-buildings job)
+RUN apk add --no-cache postgresql-client ca-certificates wget sqlite-libs zlib libstdc++ libgcc python3 py3-pip
+
+# overturemaps CLI — pulls Overture building footprints for the generate-buildings job.
+# Alpine's pip is PEP 668 "externally managed"; --break-system-packages is safe here since
+# this image runs no other Python workload it could conflict with.
+RUN pip install --no-cache-dir --break-system-packages overturemaps
 
 # Create app directory
 WORKDIR /app

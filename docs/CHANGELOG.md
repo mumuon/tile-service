@@ -4,6 +4,27 @@ A chronological summary of all changes made to the tile-service.
 
 ---
 
+## September 2026
+
+### Overture buildings job, run locally only (Sep 10)
+- Added `generate-buildings` CLI command + `overture.go`: downloads an Overture buildings
+  extract for a bbox via the `overturemaps` CLI, builds a single PMTiles archive with
+  Tippecanoe (completeness flags — no feature dropping, unlike the roads job), uploads to
+  R2/S3. Has no database dependency by design, so it can't accidentally run against a
+  shared/live Postgres instance.
+- Dockerfile now provisions `python3`/`overturemaps` in the runtime image alongside the
+  existing Tippecanoe build.
+- Owner ruling: generation always runs on the owner's machine via the local Compose rig —
+  never in hosted/cloud compute. R2 storage is cheap ($0.015/GB-month, no egress) and is
+  the only cloud-hosted piece. Runbook: `docs/LOCAL_RUN_R2.md`.
+- Verified end-to-end locally (Docker build + a small San Francisco bbox smoke test,
+  `--skip-upload`) — produced a valid, decodable PMTiles with real building footprints.
+
+## April 2026
+
+### Railway BuildKit cache-mount fixes (Apr 12)
+- **5474b03 / 74ddb73 / b04cc5a** — Gave Docker cache mounts service-specific keys (`id=` prefixed with the Railway service id) so BuildKit caching works on Railway's shared builder, and copied the `kmlconv` subpackage into the build context. Resolves cache-mount key collisions on Railway. Bumped into the main repo as `abf2b22b` (May 15).
+
 ## January 2026
 
 ### Docker & Testing Infrastructure (Jan 14)

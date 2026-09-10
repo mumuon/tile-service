@@ -54,6 +54,8 @@ func main() {
 		cmdServe(args[1:], configPath, debug)
 	} else if command == "verify" {
 		cmdVerify(args[1:], configPath, debug)
+	} else if command == "generate-buildings" {
+		cmdGenerateBuildings(args[1:], configPath)
 	} else {
 		slog.Error("unknown command", "command", command)
 		showHelp()
@@ -818,6 +820,91 @@ func cmdVerifyUpload(args []string, configPath *string) {
 	}
 }
 
+// cmdGenerateBuildings runs the Overture buildings -> PMTiles pipeline for a single bbox.
+// Deliberately does not open a database connection: this job has no DB dependency, so there
+// is no risk of it running against a shared/live Postgres instance.
+func cmdGenerateBuildings(args []string, configPath *string) {
+	fs := flag.NewFlagSet("generate-buildings", flag.ExitOnError)
+	bbox := fs.String("bbox", "", "Bounding box: minLon,minLat,maxLon,maxLat (required)")
+	minZoom := fs.Int("min-zoom", 0, "Minimum zoom level")
+	maxZoom := fs.Int("max-zoom", 14, "Maximum zoom level")
+	skipUpload := fs.Bool("skip-upload", false, "Skip R2 upload")
+	noCleanup := fs.Bool("no-cleanup", false, "Don't cleanup temporary files")
+	fs.Parse(reorderFlagsFirst(args))
+
+	regionArgs := fs.Args()
+	if len(regionArgs) == 0 {
+		slog.Error("region label required")
+		slog.Info("Usage: tile-service generate-buildings -bbox <minLon,minLat,maxLon,maxLat> <region>")
+		os.Exit(1)
+	}
+	region := regionArgs[0]
+
+	if *bbox == "" {
+		slog.Error("-bbox is required (refusing to run an unbounded global extract)")
+		os.Exit(1)
+	}
+
+	// Load env file for S3 credentials only — LoadConfig() requires DB_PASSWORD, which this
+	// job has no use for.
+	if err := loadEnvFile(*configPath); err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to load env file", "path", *configPath, "error", err)
+	}
+	localEnvPath := strings.TrimSuffix(*configPath, ".env") + ".env.local"
+	if err := loadEnvFile(localEnvPath); err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to load local env file", "path", localEnvPath, "error", err)
+	}
+
+	s3Cfg := S3Config{
+		Endpoint:        getEnv("S3_ENDPOINT", "https://s3.us-west-1.wasabisys.com"),
+		AccessKeyID:     getEnv("S3_ACCESS_KEY_ID", ""),
+		SecretAccessKey: getEnv("S3_SECRET_ACCESS_KEY", ""),
+		Region:          getEnv("S3_REGION", "us-west-1"),
+		Bucket:          getEnv("S3_BUCKET", "drivefinder-tiles"),
+		BucketPath:      getEnv("S3_BUCKET_PATH", "tiles"),
+	}
+
+	var s3Client *S3Client
+	if !*skipUpload {
+		client, err := NewS3Client(s3Cfg)
+		if err != nil {
+			slog.Error("failed to initialize S3 client (use -skip-upload to run without uploading)", "error", err)
+			os.Exit(1)
+		}
+		s3Client = client
+	}
+
+	outputDir := getEnv("OUTPUT_DIR", "./public/tiles")
+	tempDir := getEnv("TEMP_DIR", "/tmp")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		slog.Warn("received interrupt, cancelling")
+		cancel()
+	}()
+
+	pmtilesPath, sizeBytes, err := GenerateBuildingsPMTiles(ctx, BuildingsJobOptions{
+		Region:     region,
+		BBox:       *bbox,
+		MinZoom:    *minZoom,
+		MaxZoom:    *maxZoom,
+		OutputDir:  outputDir,
+		TempDir:    tempDir,
+		SkipUpload: *skipUpload,
+		NoCleanup:  *noCleanup,
+	}, s3Client)
+	if err != nil {
+		slog.Error("generate-buildings failed", "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("generate-buildings complete", "region", region, "pmtiles", pmtilesPath, "size_bytes", sizeBytes)
+}
+
 func showHelp() {
 	help := `Tile Service - Generate vector tiles from road geometry data
 
@@ -837,6 +924,7 @@ Commands:
   merge                 Merge regional tiles and upload to R2
   verify                Verify tile integrity, merge completeness, or upload status
   serve                 Start the REST API server
+  generate-buildings    Download an Overture buildings extract and build a PMTiles archive
 
 Generate Command:
   Usage: tile-service generate [options] <region> [region2] [region3] ...
@@ -864,6 +952,26 @@ Upload Command:
   Options:
     -min-zoom int         Minimum zoom level to upload (-1 = all, default -1)
     -max-zoom int         Maximum zoom level to upload (-1 = all, default -1)
+
+Generate-Buildings Command:
+  Usage: tile-service generate-buildings [options] <region>
+
+  Arguments:
+    <region>              Label for the output file and tippecanoe layer name
+
+  Options:
+    -bbox string          Required. "minLon,minLat,maxLon,maxLat" — bounds the extract
+    -min-zoom int         Minimum zoom level (default 0)
+    -max-zoom int         Maximum zoom level (default 14)
+    -skip-upload          Skip R2 upload, keep the .pmtiles file locally
+    -no-cleanup           Don't remove the scratch download directory after completion
+
+  Description:
+    Downloads Overture building footprints for the given bbox via the
+    overturemaps CLI, builds a single buildings-<region>.pmtiles archive
+    with Tippecanoe (no feature dropping — completeness matters for
+    buildings), and uploads it to R2/S3. Does not touch Postgres.
+    See tile-service/docs/LOCAL_RUN_R2.md for the full runbook.
 
 Extract Command:
   Usage: tile-service extract <tiles_directory>
