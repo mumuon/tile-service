@@ -64,6 +64,16 @@ func GenerateTilesWithOptions(ctx context.Context, geoJSONPath, region string, o
 
 	// Build Tippecanoe command
 	// NOTE: Must use separate --include flags for each property (not --include=Name)
+	//
+	// --order-descending-by=curvature + dropping the previous --preserve-input-order:
+	// --drop-densest-as-needed decides what to drop per zoom independently, and with
+	// --preserve-input-order the surviving subset was effectively arbitrary (whatever
+	// order the roads happened to be extracted in) instead of importance-ranked. That
+	// made adjacent zooms keep DIFFERENT roads, which read as flicker/popping in the
+	// client overlay. Ordering by curvature (descending) makes drops remove the
+	// lowest-curvature roads first and uniformly, so the same top roads survive at
+	// every zoom. Requires the "curvature" GeoJSON property to be numeric, not a
+	// string, or tippecanoe falls back to lexicographic ordering (see kmlconv.go).
 	cmd := exec.CommandContext(ctx, "tippecanoe",
 		"--force",
 		fmt.Sprintf("--output-to-directory=%s", tilesDir),
@@ -73,10 +83,10 @@ func GenerateTilesWithOptions(ctx context.Context, geoJSONPath, region string, o
 		fmt.Sprintf("--maximum-zoom=%d", maxZoom),
 		"--drop-densest-as-needed",
 		"--extend-zooms-if-still-dropping",
+		"--order-descending-by=curvature",
 		"--layer=roads",
 		fmt.Sprintf("--name=%s Curvy Roads", region),
 		"--attribution=Data © OpenStreetMap contributors",
-		"--preserve-input-order",
 		"--maximum-string-attribute-length=1000",
 		"--no-tile-compression",
 		"--include", "id",

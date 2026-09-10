@@ -131,9 +131,17 @@ func ConvertKMLToGeoJSON(ctx context.Context, kmlPath, region string) (string, i
 			"geometry": geometry,
 		}
 
-		// Add optional properties
+		// Add optional properties.
+		// Store curvature as a number, not a string: tippecanoe's
+		// --order-descending-by=curvature does lexicographic comparison on string
+		// attributes, which misorders multi-digit values (e.g. "150" > "9000").
 		if curvature != nil {
-			feature["properties"].(map[string]interface{})["curvature"] = *curvature
+			props := feature["properties"].(map[string]interface{})
+			if curvVal, err := strconv.ParseFloat(*curvature, 64); err == nil {
+				props["curvature"] = curvVal
+			} else {
+				props["curvature"] = *curvature
+			}
 		}
 		if hasPoints {
 			props := feature["properties"].(map[string]interface{})

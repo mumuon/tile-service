@@ -20,10 +20,23 @@ A chronological summary of all changes made to the tile-service.
 - Verified end-to-end locally (Docker build + a small San Francisco bbox smoke test,
   `--skip-upload`) — produced a valid, decodable PMTiles with real building footprints.
 
+### Zoom-Stable Curvy Roads Tiling (Sep 9)
+- Fixed flaky zoom-level rendering of the curvy-roads overlay (density popping/chopping
+  between adjacent zooms, seen in PNW screenshots at ~z6-8)
+- `tiles.go`: replaced `--preserve-input-order` with `--order-descending-by=curvature`
+  so `--drop-densest-as-needed` drops the lowest-curvature roads first and uniformly
+  at every zoom, instead of an arbitrary per-zoom subset
+- `kmlconv/kmlconv.go`: store `curvature` as a number instead of a string in the
+  generated GeoJSON, so tippecanoe's ordering does numeric (not lexicographic)
+  comparison
+- See DECISIONS.md (2026-09-09) for the local tippecanoe proof and reasoning
+
 ## April 2026
 
 ### Railway BuildKit cache-mount fixes (Apr 12)
 - **5474b03 / 74ddb73 / b04cc5a** — Gave Docker cache mounts service-specific keys (`id=` prefixed with the Railway service id) so BuildKit caching works on Railway's shared builder, and copied the `kmlconv` subpackage into the build context. Resolves cache-mount key collisions on Railway. Bumped into the main repo as `abf2b22b` (May 15).
+
+---
 
 ## January 2026
 
